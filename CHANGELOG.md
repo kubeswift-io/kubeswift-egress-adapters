@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [v0.3.0] - 2026-11-17
+
+SPIFFE TLS origination in the Envoy translator, for KubeSwift's `allow[].tls`.
+
 ### Added
 
 - SPIFFE TLS origination in the Envoy translator (`rule.tls`, KubeSwift's
