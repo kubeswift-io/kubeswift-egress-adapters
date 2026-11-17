@@ -20,7 +20,8 @@ upstream one, unchanged.
 
 `egress-translator envoy --out /config/envoy.json` reads the intent file
 (`$KUBESWIFT_EGRESS_INTENT`, else `/etc/kubeswift/egress/intent.json`) and
-writes a static Envoy bootstrap with one transparent listener:
+writes a static Envoy bootstrap with one transparent listener (plus, with
+credentials, an SDS file per certificate and credential next to it):
 
 - `cidr` rules (Services arrive resolved to `cidr` rules) forward to the
   connection's original destination.
@@ -28,10 +29,20 @@ writes a static Envoy bootstrap with one transparent listener:
   and forward to the address the name resolves to, never to the original
   destination, so a spoofed server name cannot reach another address.
 - A `host` rule without ports opens TLS on 443 and HTTP on 80.
+- A credential destination (`host:port`) is intercepted: Envoy terminates the
+  guest's TLS with the leaf certificate KubeSwift issued for the host, sets the
+  credential's header from its file (`credential_injector`), answers 403 to any
+  other `Host` and forwards over TLS, verified against the Envoy image's CA
+  bundle (`--upstream-ca`), to the name's address. An empty value answers 401.
+  Certificates and values reload when KubeSwift swaps `secretsDir`.
 - Anything else is closed. Every connection is logged on stdout.
 
+`--admin-port N` opens Envoy's admin endpoint on 127.0.0.1; its `/certs` page
+lists the serial numbers of the certificates Envoy serves, which a KubeSwift
+preset's readiness probe checks after a swap.
+
 Not supported yet, refused with an error: a DNS listener, an explicit HTTP
-listener, TLS origination and credentials.
+listener, TLS origination and wildcard credential destinations.
 
 The image is `ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator`
 and carries the label `io.kubeswift.egress-intent.versions=v1`.
@@ -56,7 +67,8 @@ ignore is a new version.
 ```bash
 go test ./...                 # unit and golden tests
 go test ./envoy -update       # rewrite envoy/testdata/*.golden.json
-./hack/validate-envoy.sh      # load every golden file in a real Envoy (docker)
+./hack/validate-envoy.sh      # load the translator's output in a real Envoy (docker)
+./hack/e2e-envoy-credentials.sh   # credential path end to end (docker)
 docker build -f images/envoy-translator/Containerfile .
 ```
 

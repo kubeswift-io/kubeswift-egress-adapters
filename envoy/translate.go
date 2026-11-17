@@ -9,11 +9,21 @@
 //   - cidr rules (and services, which KubeSwift resolves to cidr rules) match
 //     the original destination address and port, and forward to it
 //     (tcp_proxy to an ORIGINAL_DST cluster);
+//
 //   - host rules match the TLS server name (tls_inspector) or, for plain
 //     HTTP, the Host header (http_inspector + a route per host), and forward
 //     to the address the NAME resolves to (dynamic forward proxy), never to
 //     the original destination. A spoofed server name therefore cannot reach
 //     another address.
+//
+//   - a credential destination (host:port) gets its own chain: Envoy
+//     terminates the guest's TLS with the leaf certificate KubeSwift issued
+//     for the host, sets the credential's header from its file
+//     (credential_injector), refuses any other Host with 403 and forwards
+//     over TLS, verified against the image's CA bundle, to the address the
+//     name resolves to. The certificates and values are read through SDS
+//     files that watch the intent's secretsDir, so a warm slot's claim
+//     reloads them without a restart. An empty value answers 401.
 //
 // A connection that matches no chain is closed.
 //
@@ -23,15 +33,20 @@
 // host rule on 443 would hide it.
 //
 // Not supported, refused with an error: a DNS or HTTP listener, TLS
-// origination (rule.tls) and credentials.
+// origination (rule.tls), wildcard credential destinations and an intercept
+// CA key without issued certificates (this translator cannot mint).
 package envoy
 
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	v1 "github.com/kubeswift-io/kubeswift-egress-adapters/intent/v1"
 )
@@ -39,6 +54,8 @@ import (
 const (
 	originalDstCluster = "original_dst"
 	dfpCluster         = "dynamic_forward_proxy"
+	dfpTLSCluster      = "dynamic_forward_proxy_tls"
+	secretType         = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret"
 	dnsCacheName       = "egress_dns_cache"
 	// Ports a host rule without ports is opened on: TLS on 443, HTTP on 80.
 	defaultTLSPort  = 443
@@ -67,8 +84,32 @@ type cidr struct {
 	from   string
 }
 
-// Translate returns the Envoy bootstrap (JSON) for the intent.
-func Translate(in *v1.EgressIntent) ([]byte, error) {
+// Options are what the intent does not say.
+type Options struct {
+	// Dir is the absolute directory the output files are written to; the
+	// bootstrap names the SDS files in it.
+	Dir string
+	// AdminPort, when set, opens Envoy's admin endpoint on 127.0.0.1 (for a
+	// readiness probe; its /certs page lists the serving certificates).
+	AdminPort int
+	// UpstreamCA is the CA bundle intercepted connections verify upstream
+	// servers against. Default /etc/ssl/certs/ca-certificates.crt (the
+	// Envoy image's).
+	UpstreamCA string
+}
+
+// BootstrapFile is the name of the bootstrap in the output.
+const BootstrapFile = "envoy.json"
+
+// Translate returns the files to write into opt.Dir: BootstrapFile and, with
+// credentials, one SDS file per certificate and credential.
+func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
+	if !filepath.IsAbs(opt.Dir) {
+		return nil, fmt.Errorf("output directory %q is not absolute", opt.Dir)
+	}
+	if opt.UpstreamCA == "" {
+		opt.UpstreamCA = "/etc/ssl/certs/ca-certificates.crt"
+	}
 	if in.APIVersion != v1.APIVersion || in.Kind != v1.Kind {
 		return nil, fmt.Errorf("not an %s %s: apiVersion %q kind %q", v1.APIVersion, v1.Kind, in.APIVersion, in.Kind)
 	}
@@ -80,8 +121,6 @@ func Translate(in *v1.EgressIntent) ([]byte, error) {
 		return nil, fmt.Errorf("listeners.dns is set: this translator does not serve DNS (leave it unset and KubeSwift resolves only allowed names)")
 	case l.HTTP != 0:
 		return nil, fmt.Errorf("listeners.http is set: this translator has no explicit HTTP proxy listener")
-	case len(in.Credentials) > 0:
-		return nil, fmt.Errorf("credentials are not supported by this translator yet")
 	}
 
 	tlsHosts := map[int][]string{}
@@ -130,6 +169,20 @@ func Translate(in *v1.EgressIntent) ([]byte, error) {
 			return nil, fmt.Errorf("allow[%d] (%s): neither host nor cidr", i, r.From)
 		}
 	}
+	files := map[string][]byte{}
+	icepts, err := intercepts(in, tlsHosts, opt.Dir, files)
+	if err != nil {
+		return nil, err
+	}
+	for _, ic := range icepts {
+		// The intercept chain names the host exactly; the passthrough chain
+		// must not name it too (Envoy refuses two equal matches).
+		tlsHosts[ic.port] = remove(tlsHosts[ic.port], ic.host)
+		if len(tlsHosts[ic.port]) == 0 {
+			delete(tlsHosts, ic.port)
+		}
+	}
+
 	// A cidr rule for every port also holds on each port another chain names.
 	for p := range ports {
 		cidrByPort[p] = append(cidrByPort[p], cidrByPort[0]...)
@@ -181,6 +234,16 @@ func Translate(in *v1.EgressIntent) ([]byte, error) {
 	for _, p := range sortedKeys(httpHosts) {
 		chains = append(chains, httpChain(p, dedupe(httpHosts[p])))
 	}
+	for _, ic := range icepts {
+		chains = append(chains, ic.chain())
+	}
+	clusters := []obj{
+		{"name": originalDstCluster, "type": "ORIGINAL_DST", "lb_policy": "CLUSTER_PROVIDED", "connect_timeout": "5s"},
+		dfpClusterDef(dfpCluster, nil),
+	}
+	if len(icepts) > 0 {
+		clusters = append(clusters, dfpClusterDef(dfpTLSCluster, &opt))
+	}
 
 	bootstrap := obj{
 		"static_resources": obj{
@@ -194,19 +257,249 @@ func Translate(in *v1.EgressIntent) ([]byte, error) {
 				},
 				"filter_chains": chains,
 			}},
-			"clusters": []obj{
-				{"name": originalDstCluster, "type": "ORIGINAL_DST", "lb_policy": "CLUSTER_PROVIDED", "connect_timeout": "5s"},
-				{
-					"name": dfpCluster, "lb_policy": "CLUSTER_PROVIDED", "connect_timeout": "5s",
-					"cluster_type": obj{
-						"name":         "envoy.clusters.dynamic_forward_proxy",
-						"typed_config": typed("envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig", obj{"dns_cache_config": dnsCache}),
-					},
-				},
-			},
+			"clusters": clusters,
 		},
 	}
-	return json.MarshalIndent(bootstrap, "", "  ")
+	if len(icepts) > 0 {
+		// SDS needs a node identity.
+		bootstrap["node"] = obj{"id": "kubeswift-sandbox", "cluster": "kubeswift-egress"}
+	}
+	if opt.AdminPort > 0 {
+		if opt.AdminPort > 65535 || int32(opt.AdminPort) == l.Transparent {
+			return nil, fmt.Errorf("admin port %d is not a free port", opt.AdminPort)
+		}
+		bootstrap["admin"] = obj{"address": obj{"socket_address": obj{"address": "127.0.0.1", "port_value": opt.AdminPort}}}
+	}
+	b, err := json.MarshalIndent(bootstrap, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	files[BootstrapFile] = b
+	return files, nil
+}
+
+func dfpClusterDef(name string, tls *Options) obj {
+	c := obj{
+		"name": name, "lb_policy": "CLUSTER_PROVIDED", "connect_timeout": "5s",
+		"cluster_type": obj{
+			"name":         "envoy.clusters.dynamic_forward_proxy",
+			"typed_config": typed("envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig", obj{"dns_cache_config": dnsCache}),
+		},
+	}
+	if tls != nil {
+		// The upstream server is verified against the name the guest asked
+		// for (auto_sni + auto_san_validation take it from the Host).
+		c["transport_socket"] = obj{
+			"name": "envoy.transport_sockets.tls",
+			"typed_config": typed("envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext", obj{
+				"common_tls_context": obj{"validation_context": obj{"trusted_ca": obj{"filename": tls.UpstreamCA}}},
+			}),
+		}
+		c["typed_extension_protocol_options"] = obj{
+			"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": typed("envoy.extensions.upstreams.http.v3.HttpProtocolOptions", obj{
+				"upstream_http_protocol_options": obj{"auto_sni": true, "auto_san_validation": true},
+				"explicit_http_config":           obj{"http_protocol_options": obj{}},
+			}),
+		}
+	}
+	return c
+}
+
+var credName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// intercept is one credential destination.
+type intercept struct {
+	host  string
+	port  int
+	cert  string // SDS secret name of the leaf certificate
+	creds []icred
+	sdsFn func(name string) obj
+}
+
+type icred struct {
+	name, header, sds string
+}
+
+// intercepts groups the credentials by destination and writes their SDS
+// files into files. tlsHosts are the passthrough TLS names per port: every
+// destination must be one of them (or match a wildcard there).
+func intercepts(in *v1.EgressIntent, tlsHosts map[int][]string, dir string, files map[string][]byte) ([]*intercept, error) {
+	if len(in.Credentials) == 0 {
+		return nil, nil
+	}
+	switch {
+	case in.TLS == nil || len(in.TLS.Certificates) == 0:
+		return nil, fmt.Errorf("credentials need tls.certificates: this translator cannot mint certificates from the intercept CA")
+	case in.SecretsDir == "" || !filepath.IsAbs(in.SecretsDir):
+		return nil, fmt.Errorf("credentials need an absolute secretsDir, got %q", in.SecretsDir)
+	}
+	watch := obj{"path": in.SecretsDir}
+	inDir := func(f string) error {
+		if filepath.Dir(f) != filepath.Clean(in.SecretsDir) {
+			return fmt.Errorf("%s is not in secretsDir %s", f, in.SecretsDir)
+		}
+		return nil
+	}
+	sds := func(name string) obj {
+		return obj{"name": name, "sds_config": obj{"path_config_source": obj{"path": filepath.Join(dir, "sds-"+name+".json")}}}
+	}
+	put := func(name string, secret obj) error {
+		secret["@type"] = secretType
+		secret["name"] = name
+		b, err := json.MarshalIndent(obj{"resources": []obj{secret}}, "", "  ")
+		files["sds-"+name+".json"] = b
+		return err
+	}
+	certFor := map[string]string{}
+	for i, c := range in.TLS.Certificates {
+		if err := inDir(c.Cert); err != nil {
+			return nil, fmt.Errorf("tls.certificates[%d]: %w", i, err)
+		}
+		if err := inDir(c.Key); err != nil {
+			return nil, fmt.Errorf("tls.certificates[%d]: %w", i, err)
+		}
+		name := "ks-cert-" + strconv.Itoa(i)
+		if err := put(name, obj{"tls_certificate": obj{
+			"certificate_chain": obj{"filename": c.Cert},
+			"private_key":       obj{"filename": c.Key},
+			"watched_directory": watch,
+		}}); err != nil {
+			return nil, err
+		}
+		for _, h := range c.Hosts {
+			if _, dup := certFor[h]; !dup {
+				certFor[h] = name
+			}
+		}
+	}
+	byDest := map[string]*intercept{}
+	for i, c := range in.Credentials {
+		at := fmt.Sprintf("credentials[%d] (%s)", i, c.Name)
+		if !credName.MatchString(c.Name) || c.Header == "" {
+			return nil, fmt.Errorf("%s: needs a name and a header", at)
+		}
+		value := c.HeaderValueFile
+		if value == "" {
+			if c.ValueTemplate != "{}" {
+				return nil, fmt.Errorf("%s: value template %q needs headerValueFile (this translator cannot apply a template)", at, c.ValueTemplate)
+			}
+			value = c.File
+		}
+		if err := inDir(value); err != nil {
+			return nil, fmt.Errorf("%s: %w", at, err)
+		}
+		name := "ks-cred-" + c.Name
+		if err := put(name, obj{"generic_secret": obj{"secret": obj{"filename": value, "watched_directory": watch}}}); err != nil {
+			return nil, err
+		}
+		for _, d := range c.Destinations {
+			host, ps, err := net.SplitHostPort(d)
+			port, perr := strconv.Atoi(ps)
+			switch {
+			case err != nil || perr != nil || port < 1 || port > 65535:
+				return nil, fmt.Errorf("%s: destination %q is not host:port", at, d)
+			case strings.HasPrefix(host, "*."):
+				return nil, fmt.Errorf("%s: destination %q: wildcard credential destinations are not supported", at, d)
+			case !covered(host, tlsHosts[port]):
+				return nil, fmt.Errorf("%s: destination %q is not allowed by a host rule on port %d", at, d, port)
+			case certFor[host] == "":
+				return nil, fmt.Errorf("%s: destination %q has no certificate in tls.certificates", at, d)
+			}
+			key := host + ":" + strconv.Itoa(port)
+			ic := byDest[key]
+			if ic == nil {
+				ic = &intercept{host: host, port: port, cert: certFor[host]}
+				byDest[key] = ic
+			}
+			for _, o := range ic.creds {
+				if strings.EqualFold(o.header, c.Header) {
+					return nil, fmt.Errorf("%s: destination %q gets header %s from %s too", at, d, c.Header, o.name)
+				}
+			}
+			ic.creds = append(ic.creds, icred{name: c.Name, header: c.Header, sds: name})
+		}
+	}
+	keys := make([]string, 0, len(byDest))
+	for k := range byDest {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*intercept, 0, len(keys))
+	for _, k := range keys {
+		ic := byDest[k]
+		ic.sdsFn = sds
+		out = append(out, ic)
+	}
+	return out, nil
+}
+
+// covered: host equals one of names or is under a "*." name in it.
+func covered(host string, names []string) bool {
+	for _, n := range names {
+		if n == host || (strings.HasPrefix(n, "*.") && strings.HasSuffix(host, n[1:])) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ic *intercept) chain() obj {
+	filters := []obj{{"name": "envoy.filters.http.dynamic_forward_proxy", "typed_config": typed("envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig", obj{"dns_cache_config": dnsCache})}}
+	for _, c := range ic.creds {
+		filters = append(filters, obj{
+			"name": "envoy.filters.http.credential_injector",
+			"typed_config": typed("envoy.extensions.filters.http.credential_injector.v3.CredentialInjector", obj{
+				"overwrite": true,
+				"credential": obj{
+					"name": "envoy.http.injected_credentials.generic",
+					"typed_config": typed("envoy.extensions.http.injected_credentials.generic.v3.Generic", obj{
+						"header": c.header, "credential": ic.sdsFn(c.sds),
+					}),
+				},
+			}),
+		})
+	}
+	filters = append(filters, obj{"name": "envoy.filters.http.router", "typed_config": typed("envoy.extensions.filters.http.router.v3.Router", nil)})
+	domains := []string{ic.host + ":" + strconv.Itoa(ic.port)}
+	if ic.port == defaultTLSPort {
+		domains = []string{ic.host, ic.host + ":443"}
+	}
+	vhosts := []obj{
+		{"name": "host-" + ic.host, "domains": domains, "routes": []obj{{"match": obj{"prefix": "/"}, "route": obj{"cluster": dfpTLSCluster}}}},
+		{"name": "deny", "domains": []string{"*"}, "routes": []obj{{"match": obj{"prefix": "/"}, "direct_response": obj{"status": 403}}}},
+	}
+	return obj{
+		"name":               "intercept-" + ic.host + "-" + strconv.Itoa(ic.port),
+		"filter_chain_match": obj{"destination_port": ic.port, "transport_protocol": "tls", "server_names": []string{ic.host}},
+		"transport_socket": obj{
+			"name": "envoy.transport_sockets.tls",
+			"typed_config": typed("envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext", obj{
+				"common_tls_context": obj{
+					"tls_certificate_sds_secret_configs": []obj{ic.sdsFn(ic.cert)},
+					"alpn_protocols":                     []string{"http/1.1"},
+				},
+			}),
+		},
+		"filters": []obj{{
+			"name": "envoy.filters.network.http_connection_manager",
+			"typed_config": typed("envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", obj{
+				"stat_prefix":  "intercept",
+				"access_log":   stdoutLog,
+				"route_config": obj{"name": "intercept", "virtual_hosts": vhosts},
+				"http_filters": filters,
+			}),
+		}},
+	}
+}
+
+func remove(s []string, x string) []string {
+	var out []string
+	for _, v := range s {
+		if v != x {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // httpChain serves plain HTTP on port p: a virtual host per allowed host

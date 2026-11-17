@@ -5,7 +5,11 @@
 // container next to an unmodified proxy image, and writes the configuration
 // into a volume the proxy reads.
 //
-//	egress-translator envoy [--intent PATH] --out PATH
+//	egress-translator envoy [--intent PATH] --out PATH [--admin-port N] [--upstream-ca PATH]
+//
+// --out names the bootstrap; SDS files for credentials are written next to
+// it. --admin-port opens Envoy's admin endpoint on 127.0.0.1 (a preset's
+// readiness probe reads /certs there).
 //
 // --intent defaults to $KUBESWIFT_EGRESS_INTENT, then
 // /etc/kubeswift/egress/intent.json. Unknown intent fields are ignored, as
@@ -18,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/kubeswift-io/kubeswift-egress-adapters/envoy"
 	v1 "github.com/kubeswift-io/kubeswift-egress-adapters/intent/v1"
@@ -40,7 +45,9 @@ func run(args []string) error {
 		def = v1.Path
 	}
 	intentPath := fs.String("intent", def, "egress-intent file")
-	out := fs.String("out", "", "where to write the proxy configuration")
+	out := fs.String("out", "", "where to write the Envoy bootstrap; SDS files go next to it")
+	admin := fs.Int("admin-port", 0, "open Envoy's admin endpoint on 127.0.0.1:N")
+	upstreamCA := fs.String("upstream-ca", "", "CA bundle for intercepted upstreams (default the Envoy image's)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -55,16 +62,42 @@ func run(args []string) error {
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return fmt.Errorf("%s: %w", *intentPath, err)
 	}
-	cfg, err := envoy.Translate(&in)
+	dir, err := filepath.Abs(filepath.Dir(*out))
 	if err != nil {
 		return err
 	}
-	// Written whole, then renamed: the proxy never reads a partial file.
-	tmp, err := os.CreateTemp(filepath.Dir(*out), ".envoy-*.json")
+	files, err := envoy.Translate(&in, envoy.Options{Dir: dir, AdminPort: *admin, UpstreamCA: *upstreamCA})
 	if err != nil {
 		return err
 	}
-	if _, err := tmp.Write(append(cfg, '\n')); err != nil {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	// SDS files first, bootstrap last; each written whole, then renamed, so
+	// the proxy never reads a partial file.
+	for _, name := range names {
+		if name == envoy.BootstrapFile {
+			continue
+		}
+		if err := write(filepath.Join(dir, name), files[name]); err != nil {
+			return err
+		}
+	}
+	if err := write(filepath.Join(dir, filepath.Base(*out)), files[envoy.BootstrapFile]); err != nil {
+		return err
+	}
+	fmt.Printf("egress-translator: %s (%d allow rules, %d credentials) -> %s\n", *intentPath, len(in.Allow), len(in.Credentials), *out)
+	return nil
+}
+
+func write(path string, b []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -74,9 +107,5 @@ func run(args []string) error {
 	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp.Name(), *out); err != nil {
-		return err
-	}
-	fmt.Printf("egress-translator: %s (%d allow rules) -> %s\n", *intentPath, len(in.Allow), *out)
-	return nil
+	return os.Rename(tmp.Name(), path)
 }

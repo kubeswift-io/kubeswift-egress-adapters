@@ -25,6 +25,10 @@ jobs:
       - name: envoy --mode validate
         run: |
           for v in v1.36.2 v1.35.6; do ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/validate-envoy.sh; done
+      # The credential path end to end: translator + Envoy + a TLS upstream.
+      - name: credentials behaviour
+        run: |
+          for v in v1.36.2 v1.35.6; do ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/e2e-envoy-credentials.sh; done
 
   image:
     runs-on: ubuntu-latest
