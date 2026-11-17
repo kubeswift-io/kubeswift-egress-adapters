@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [v0.2.0] - 2026-11-17
+
+Credentials in the Envoy translator, for KubeSwift egress credentials.
 
 ### Added
 
