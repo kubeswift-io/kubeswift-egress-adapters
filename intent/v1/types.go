@@ -23,6 +23,17 @@ const Path = "/etc/kubeswift/egress/intent.json"
 // reads, comma-separated (for example "v1").
 const ImageLabel = "io.kubeswift.egress-intent.versions"
 
+// FeaturesLabel on the same image lists optional parts of v1 it implements,
+// comma-separated. KubeSwift writes an optional part only for an image that
+// declares it, and refuses a sandbox that needs one its image lacks.
+const FeaturesLabel = "io.kubeswift.egress-intent.features"
+
+// FeatureTLSOriginate: Rule.TLS. The proxy connects to the rule's
+// destinations over TLS presenting the X.509-SVID from Identity.SPIFFE and
+// accepts only an upstream SVID of the same trust domain; the guest speaks
+// plaintext (for a host rule, HTTP, matched by its Host header).
+const FeatureTLSOriginate = "tls-originate"
+
 // EgressIntent is the whole file.
 type EgressIntent struct {
 	// APIVersion is APIVersion.
@@ -185,11 +196,15 @@ type Identity struct {
 	SPIFFE *SPIFFE `json:"spiffe,omitempty"`
 }
 
-// SPIFFE points at the SPIFFE Workload API. The SVID's ID is the sandbox's;
-// a proxy must treat an SVID whose path has no "/sandbox/" segment as not yet
-// issued (a warm slot before checkout).
+// SPIFFE points at the SPIFFE Workload API, where the proxy fetches the
+// launcher's X.509-SVID. A warm slot's ID is issued when the slot boots and
+// does not change at checkout.
 type SPIFFE struct {
 	// WorkloadAPISocket is the Workload API address, e.g.
-	// unix:///run/spiffe/agent.sock.
+	// unix:///run/spiffe/spire-agent.sock.
 	WorkloadAPISocket string `json:"workloadAPISocket"`
+	// ID is the SPIFFE ID registered for this launcher. The SVID may arrive
+	// a moment after the proxy starts; a proxy waits for it rather than
+	// failing.
+	ID string `json:"id,omitempty"`
 }
