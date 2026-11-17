@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -27,16 +28,34 @@ func load(t *testing.T, path string) *v1.EgressIntent {
 	return &in
 }
 
+// goldenDir is the output directory the golden files are rendered for.
+const goldenDir = "/etc/kubeswift/egress-proxy"
+
+// render returns every output file in one JSON document, keyed by name.
+func render(t *testing.T, in *v1.EgressIntent, opt Options) []byte {
+	t.Helper()
+	files, err := Translate(in, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := map[string]json.RawMessage{}
+	for name, b := range files {
+		all[name] = b
+	}
+	out, err := json.MarshalIndent(all, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 // The translation of each testdata intent matches its golden file
-// (go test ./envoy -update rewrites them; hack/validate-envoy.sh checks them
-// with a real Envoy).
+// (go test ./envoy -update rewrites them; hack/validate-envoy.sh loads the
+// translator's real output in Envoy).
 func TestGolden(t *testing.T) {
-	for _, name := range []string{"basic", "cidr-any-port"} {
+	for _, name := range []string{"basic", "cidr-any-port", "credentials"} {
 		t.Run(name, func(t *testing.T) {
-			got, err := Translate(load(t, "testdata/"+name+".intent.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			got := render(t, load(t, "testdata/"+name+".intent.json"), Options{Dir: goldenDir, AdminPort: 15000})
 			golden := "testdata/" + name + ".golden.json"
 			if *update {
 				if err := os.WriteFile(golden, append(got, '\n'), 0o644); err != nil {
@@ -61,10 +80,11 @@ type chain struct {
 
 func chains(t *testing.T, in *v1.EgressIntent) map[string]map[string]any {
 	t.Helper()
-	b, err := Translate(in)
+	files, err := Translate(in, Options{Dir: goldenDir})
 	if err != nil {
 		t.Fatal(err)
 	}
+	b := files[BootstrapFile]
 	var bs struct {
 		StaticResources struct {
 			Listeners []struct {
@@ -129,13 +149,78 @@ func TestHostWithoutPorts(t *testing.T) {
 func TestRefusals(t *testing.T) {
 	for name, in := range map[string]*v1.EgressIntent{
 		"dns listener":    func() *v1.EgressIntent { i := intent(); i.Listeners.DNS = 15053; return i }(),
-		"credentials":     func() *v1.EgressIntent { i := intent(); i.Credentials = []v1.Credential{{Name: "K"}}; return i }(),
 		"tls origination": intent(v1.Rule{CIDR: "10.0.0.1/32", TLS: &v1.RuleTLS{Originate: "SPIFFE"}, From: "x"}),
 		"wrong version":   func() *v1.EgressIntent { i := intent(); i.APIVersion = "egress-intent.kubeswift.io/v2"; return i }(),
 		"ipv6 cidr":       intent(v1.Rule{CIDR: "fd00::/8", From: "x"}),
 	} {
-		if _, err := Translate(in); err == nil {
+		if _, err := Translate(in, Options{Dir: goldenDir}); err == nil {
 			t.Errorf("%s: translated, want an error", name)
 		}
+	}
+}
+
+func credIntent(mut func(*v1.EgressIntent)) *v1.EgressIntent {
+	in := intent(v1.Rule{Host: "api.example.com", Ports: tcp(443), From: "host api.example.com"})
+	in.SecretsDir = "/run/kubeswift/egress/secrets"
+	in.TLS = &v1.TLS{
+		InterceptCA:  v1.CA{Cert: "/run/kubeswift/egress/secrets/ca.crt"},
+		Certificates: []v1.Certificate{{Hosts: []string{"api.example.com"}, Cert: "/run/kubeswift/egress/secrets/cert-0.crt", Key: "/run/kubeswift/egress/secrets/cert-0.key"}},
+	}
+	in.Credentials = []v1.Credential{{
+		Name: "API_KEY", Placeholder: "ks-0123456789abcdef", Destinations: []string{"api.example.com:443"},
+		Header: "Authorization", ValueTemplate: "Bearer {}",
+		File: "/run/kubeswift/egress/secrets/cred-API_KEY", HeaderValueFile: "/run/kubeswift/egress/secrets/header-API_KEY",
+	}}
+	if mut != nil {
+		mut(in)
+	}
+	return in
+}
+
+// A credential destination gets an intercept chain, and the passthrough TLS
+// chain no longer names the host (Envoy refuses two equal matches); with no
+// other name left on the port the passthrough chain is gone (an empty
+// server_names would match every name).
+func TestCredentialIntercept(t *testing.T) {
+	cs := chains(t, credIntent(nil))
+	if _, ok := cs["intercept-api.example.com-443"]; !ok {
+		t.Fatalf("no intercept chain: %v", cs)
+	}
+	if _, ok := cs["tls-443"]; ok {
+		t.Errorf("tls-443 still present: %v", cs["tls-443"])
+	}
+	cs = chains(t, credIntent(func(in *v1.EgressIntent) {
+		in.Allow = append(in.Allow, v1.Rule{Host: "other.example.com", Ports: tcp(443), From: "host other.example.com"})
+	}))
+	if names := cs["tls-443"]["server_names"]; !reflect.DeepEqual(names, []any{"other.example.com"}) {
+		t.Errorf("tls-443 server_names = %v", names)
+	}
+}
+
+func TestCredentialRefusals(t *testing.T) {
+	for name, mut := range map[string]func(*v1.EgressIntent){
+		"no certificates":   func(in *v1.EgressIntent) { in.TLS.Certificates = nil },
+		"no secretsDir":     func(in *v1.EgressIntent) { in.SecretsDir = "" },
+		"template, no file": func(in *v1.EgressIntent) { in.Credentials[0].HeaderValueFile = "" },
+		"wildcard":          func(in *v1.EgressIntent) { in.Credentials[0].Destinations = []string{"*.example.com:443"} },
+		"not allowed":       func(in *v1.EgressIntent) { in.Credentials[0].Destinations = []string{"api.example.com:8443"} },
+		"no cert for host":  func(in *v1.EgressIntent) { in.TLS.Certificates[0].Hosts = []string{"x.example.com"} },
+		"file outside dir":  func(in *v1.EgressIntent) { in.Credentials[0].HeaderValueFile = "/etc/passwd" },
+		"same header twice": func(in *v1.EgressIntent) {
+			c := in.Credentials[0]
+			c.Name = "OTHER"
+			in.Credentials = append(in.Credentials, c)
+		},
+	} {
+		if _, err := Translate(credIntent(mut), Options{Dir: goldenDir}); err == nil {
+			t.Errorf("%s: translated, want an error", name)
+		}
+	}
+	// A bare "{}" template needs no rendered file.
+	if _, err := Translate(credIntent(func(in *v1.EgressIntent) {
+		in.Credentials[0].ValueTemplate = "{}"
+		in.Credentials[0].HeaderValueFile = ""
+	}), Options{Dir: goldenDir}); err != nil {
+		t.Errorf("template {}: %v", err)
 	}
 }
