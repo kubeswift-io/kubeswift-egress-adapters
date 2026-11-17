@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write # keyless cosign signing (Sigstore OIDC)
+
+env:
+  IMAGE: ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # A missing entry is fatal: the CHANGELOG section is the release page.
+      - name: Release notes from the CHANGELOG
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          awk -v h="## [${tag}]" 'index($0, h) == 1 {p = 1; next} /^## \[/ && p {exit} p' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md" || { echo "::error::CHANGELOG.md has no ## [${tag}] entry"; exit 1; }
+
+      - name: Test
+        run: |
+          go vet ./...
+          go test ./...
+          for v in v1.36.2 v1.35.6; do ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/validate-envoy.sh; done
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push envoy-translator
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/envoy-translator/Containerfile
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+
+      # KubeSwift refuses a translator whose image does not declare the intent
+      # versions it reads (EgressIntentUnsupported), so check the pushed image.
+      # With provenance attached the push is an index, keyed by platform.
+      - name: Check the intent-versions label
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
+          v=$(docker buildx imagetools inspect "$ref" --format '{{ json .Image }}' | jq -r '(if has("config") then . else .["linux/amd64"] end).config.Labels["io.kubeswift.egress-intent.versions"] // empty')
+          [ "$v" = v1 ] || { echo "::error::$ref has io.kubeswift.egress-intent.versions=\"$v\", want v1"; exit 1; }
+          echo "$ref: io.kubeswift.egress-intent.versions=$v"
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: 'v2.6.5' # same cosign as KubeSwift's releases
+
+      # Verify with:
+      #   cosign verify ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator:<tag> \
+      #     --certificate-identity-regexp '^https://github\.com/kubeswift-io/kubeswift-egress-adapters/\.github/workflows/release\.yaml@refs/tags/v.*$' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Sign and verify
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
+          cosign sign "$ref"
+          cosign verify "$ref" \
+            --certificate-identity-regexp '^https://github\.com/kubeswift-io/kubeswift-egress-adapters/\.github/workflows/release\.yaml@refs/tags/v.*$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          echo "$ref signed and verified"
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            cat "$RUNNER_TEMP/notes.md"
+            printf '\n### Image\n\n```\n%s:%s\n%s@%s\n```\n' "$IMAGE" "$GITHUB_REF_NAME" "$IMAGE" "${{ steps.build.outputs.digest }}"
+          } > "$RUNNER_TEMP/body.md"
+          gh release create "$GITHUB_REF_NAME" --title "kubeswift-egress-adapters $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/body.md" --verify-tag
