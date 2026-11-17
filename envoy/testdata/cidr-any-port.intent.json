@@ -1,0 +1,10 @@
+{
+  "apiVersion": "egress-intent.kubeswift.io/v1",
+  "kind": "EgressIntent",
+  "owner": {"namespace": "team-a", "kind": "SwiftSandbox", "name": "job"},
+  "listeners": {"transparent": 15006},
+  "allow": [
+    {"cidr": "203.0.113.0/24", "from": "cidr 203.0.113.0/24"},
+    {"host": "api.example.com", "ports": [{"port": 443, "protocol": "TCP"}], "from": "host api.example.com"}
+  ]
+}

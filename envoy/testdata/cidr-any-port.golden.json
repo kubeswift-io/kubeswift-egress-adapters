@@ -1,0 +1,241 @@
+{
+  "static_resources": {
+    "clusters": [
+      {
+        "connect_timeout": "5s",
+        "lb_policy": "CLUSTER_PROVIDED",
+        "name": "original_dst",
+        "type": "ORIGINAL_DST"
+      },
+      {
+        "cluster_type": {
+          "name": "envoy.clusters.dynamic_forward_proxy",
+          "typed_config": {
+            "@type": "type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig",
+            "dns_cache_config": {
+              "dns_lookup_family": "V4_ONLY",
+              "name": "egress_dns_cache"
+            }
+          }
+        },
+        "connect_timeout": "5s",
+        "lb_policy": "CLUSTER_PROVIDED",
+        "name": "dynamic_forward_proxy"
+      }
+    ],
+    "listeners": [
+      {
+        "address": {
+          "socket_address": {
+            "address": "0.0.0.0",
+            "port_value": 15006
+          }
+        },
+        "filter_chains": [
+          {
+            "filter_chain_match": {
+              "prefix_ranges": [
+                {
+                  "address_prefix": "203.0.113.0",
+                  "prefix_len": 24
+                }
+              ]
+            },
+            "filters": [
+              {
+                "name": "envoy.filters.network.tcp_proxy",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+                  "access_log": [
+                    {
+                      "name": "envoy.access_loggers.stdout",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog"
+                      }
+                    }
+                  ],
+                  "cluster": "original_dst",
+                  "stat_prefix": "cidr"
+                }
+              }
+            ],
+            "name": "cidr-any"
+          },
+          {
+            "filter_chain_match": {
+              "destination_port": 443,
+              "prefix_ranges": [
+                {
+                  "address_prefix": "203.0.113.0",
+                  "prefix_len": 24
+                }
+              ]
+            },
+            "filters": [
+              {
+                "name": "envoy.filters.network.tcp_proxy",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+                  "access_log": [
+                    {
+                      "name": "envoy.access_loggers.stdout",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog"
+                      }
+                    }
+                  ],
+                  "cluster": "original_dst",
+                  "stat_prefix": "cidr"
+                }
+              }
+            ],
+            "name": "cidr-443"
+          },
+          {
+            "filter_chain_match": {
+              "destination_port": 443,
+              "server_names": [
+                "api.example.com"
+              ],
+              "transport_protocol": "tls"
+            },
+            "filters": [
+              {
+                "name": "envoy.filters.network.sni_dynamic_forward_proxy",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.sni_dynamic_forward_proxy.v3.FilterConfig",
+                  "dns_cache_config": {
+                    "dns_lookup_family": "V4_ONLY",
+                    "name": "egress_dns_cache"
+                  },
+                  "port_value": 443
+                }
+              },
+              {
+                "name": "envoy.filters.network.tcp_proxy",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+                  "access_log": [
+                    {
+                      "name": "envoy.access_loggers.stdout",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog"
+                      }
+                    }
+                  ],
+                  "cluster": "dynamic_forward_proxy",
+                  "stat_prefix": "tls"
+                }
+              }
+            ],
+            "name": "tls-443"
+          },
+          {
+            "filter_chain_match": {
+              "application_protocols": [
+                "http/1.0",
+                "http/1.1"
+              ],
+              "destination_port": 443,
+              "transport_protocol": "raw_buffer"
+            },
+            "filters": [
+              {
+                "name": "envoy.filters.network.http_connection_manager",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                  "access_log": [
+                    {
+                      "name": "envoy.access_loggers.stdout",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog"
+                      }
+                    }
+                  ],
+                  "http_filters": [
+                    {
+                      "name": "envoy.filters.http.dynamic_forward_proxy",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig",
+                        "dns_cache_config": {
+                          "dns_lookup_family": "V4_ONLY",
+                          "name": "egress_dns_cache"
+                        }
+                      }
+                    },
+                    {
+                      "name": "envoy.filters.http.router",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                      }
+                    }
+                  ],
+                  "route_config": {
+                    "name": "egress",
+                    "virtual_hosts": [
+                      {
+                        "domains": [
+                          "api.example.com:443"
+                        ],
+                        "name": "host-api.example.com",
+                        "routes": [
+                          {
+                            "match": {
+                              "prefix": "/"
+                            },
+                            "route": {
+                              "cluster": "dynamic_forward_proxy"
+                            }
+                          }
+                        ]
+                      },
+                      {
+                        "domains": [
+                          "*"
+                        ],
+                        "name": "deny",
+                        "routes": [
+                          {
+                            "direct_response": {
+                              "status": 403
+                            },
+                            "match": {
+                              "prefix": "/"
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  "stat_prefix": "http"
+                }
+              }
+            ],
+            "name": "http-443"
+          }
+        ],
+        "listener_filters": [
+          {
+            "name": "envoy.filters.listener.original_dst",
+            "typed_config": {
+              "@type": "type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst"
+            }
+          },
+          {
+            "name": "envoy.filters.listener.tls_inspector",
+            "typed_config": {
+              "@type": "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"
+            }
+          },
+          {
+            "name": "envoy.filters.listener.http_inspector",
+            "typed_config": {
+              "@type": "type.googleapis.com/envoy.extensions.filters.listener.http_inspector.v3.HttpInspector"
+            }
+          }
+        ],
+        "name": "transparent"
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+# egress-translator for Envoy: runs once as an init container, reads the
+# egress-intent file KubeSwift mounts and writes an Envoy bootstrap for an
+# unmodified Envoy image. It is not a proxy and opens no socket.
+FROM golang:1.27-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS builder
+WORKDIR /src
+COPY go.mod ./
+COPY intent ./intent
+COPY envoy ./envoy
+COPY cmd ./cmd
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/egress-translator ./cmd/egress-translator
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+LABEL io.kubeswift.egress-intent.versions="v1" \
+      org.opencontainers.image.source="https://github.com/kubeswift-io/kubeswift-egress-adapters" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.description="Translates KubeSwift egress-intent v1 into an Envoy bootstrap"
+COPY --from=builder /out/egress-translator /egress-translator
+USER 65532:65532
+ENTRYPOINT ["/egress-translator", "envoy"]
