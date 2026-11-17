@@ -25,6 +25,15 @@
 //     files that watch the intent's secretsDir, so a warm slot's claim
 //     reloads them without a restart. An empty value answers 401.
 //
+//   - a rule with tls (originate SPIFFE) gets the same match, but the guest
+//     speaks plaintext and Envoy connects over TLS presenting the sandbox's
+//     X.509-SVID, read over SDS from the SPIFFE agent at
+//     identity.spiffe.workloadAPISocket (SPIRE's SDS: the "default" SVID and
+//     the "ROOTCA" bundle), and accepts only an upstream SVID of the
+//     sandbox's trust domain (a URI SAN under spiffe://<trust domain>/). A
+//     host rule with tls is served on its ports as plain HTTP (the Host
+//     header picks the rule) and forwarded with SNI; it needs ports.
+//
 // A connection that matches no chain is closed.
 //
 // Envoy matches the destination port before anything else, and a chain that
@@ -32,9 +41,9 @@
 // rule for every port is repeated for each port another rule names, or a
 // host rule on 443 would hide it.
 //
-// Not supported, refused with an error: a DNS or HTTP listener, TLS
-// origination (rule.tls), wildcard credential destinations and an intercept
-// CA key without issued certificates (this translator cannot mint).
+// Not supported, refused with an error: a DNS or HTTP listener, wildcard
+// credential destinations and an intercept CA key without issued
+// certificates (this translator cannot mint).
 package envoy
 
 import (
@@ -55,8 +64,12 @@ const (
 	originalDstCluster = "original_dst"
 	dfpCluster         = "dynamic_forward_proxy"
 	dfpTLSCluster      = "dynamic_forward_proxy_tls"
-	secretType         = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret"
-	dnsCacheName       = "egress_dns_cache"
+	// TLS origination with the sandbox's SVID.
+	originalDstSPIFFECluster = "original_dst_spiffe"
+	dfpSPIFFECluster         = "dynamic_forward_proxy_spiffe"
+	spiffeAgentCluster       = "spiffe_workload_api"
+	secretType               = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret"
+	dnsCacheName             = "egress_dns_cache"
 	// Ports a host rule without ports is opened on: TLS on 443, HTTP on 80.
 	defaultTLSPort  = 443
 	defaultHTTPPort = 80
@@ -96,6 +109,10 @@ type Options struct {
 	// servers against. Default /etc/ssl/certs/ca-certificates.crt (the
 	// Envoy image's).
 	UpstreamCA string
+	// SVIDName and BundleName are the SDS resource names of the SVID and of
+	// the trust domain's bundle at the SPIFFE agent. Default "default" and
+	// "ROOTCA" (SPIRE's).
+	SVIDName, BundleName string
 }
 
 // BootstrapFile is the name of the bootstrap in the output.
@@ -109,6 +126,12 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 	}
 	if opt.UpstreamCA == "" {
 		opt.UpstreamCA = "/etc/ssl/certs/ca-certificates.crt"
+	}
+	if opt.SVIDName == "" {
+		opt.SVIDName = "default"
+	}
+	if opt.BundleName == "" {
+		opt.BundleName = "ROOTCA"
 	}
 	if in.APIVersion != v1.APIVersion || in.Kind != v1.Kind {
 		return nil, fmt.Errorf("not an %s %s: apiVersion %q kind %q", v1.APIVersion, v1.Kind, in.APIVersion, in.Kind)
@@ -125,11 +148,19 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 
 	tlsHosts := map[int][]string{}
 	httpHosts := map[int][]string{}
-	cidrByPort := map[int][]cidr{} // port 0: every port
+	spiffeHosts := map[int]map[string]bool{} // host rules with tls, per port
+	cidrByPort := map[int][]cidr{}           // port 0: every port
+	spiffeCIDRByPort := map[int][]cidr{}
 	ports := map[int]bool{}
+	anyOriginate := false
 	for i, r := range in.Allow {
+		originate := false
 		if r.TLS != nil {
-			return nil, fmt.Errorf("allow[%d] (%s): TLS origination is not supported by this translator yet", i, r.From)
+			if r.TLS.Originate != "SPIFFE" {
+				return nil, fmt.Errorf("allow[%d] (%s): tls.originate %q is not SPIFFE", i, r.From, r.TLS.Originate)
+			}
+			originate = true
+			anyOriginate = true
 		}
 		rulePorts := []int{}
 		for _, p := range r.Ports {
@@ -141,6 +172,18 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 		switch {
 		case r.Host != "" && r.CIDR != "":
 			return nil, fmt.Errorf("allow[%d] (%s): host and cidr both set", i, r.From)
+		case r.Host != "" && originate:
+			if len(rulePorts) == 0 {
+				return nil, fmt.Errorf("allow[%d] (%s): a host rule with tls needs ports (the guest speaks HTTP on them)", i, r.From)
+			}
+			for _, p := range rulePorts {
+				httpHosts[p] = append(httpHosts[p], r.Host)
+				if spiffeHosts[p] == nil {
+					spiffeHosts[p] = map[string]bool{}
+				}
+				spiffeHosts[p][r.Host] = true
+				ports[p] = true
+			}
 		case r.Host != "":
 			if len(rulePorts) == 0 {
 				tlsHosts[defaultTLSPort] = append(tlsHosts[defaultTLSPort], r.Host)
@@ -158,11 +201,15 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 				return nil, fmt.Errorf("allow[%d] (%s): cidr %q is not an IPv4 prefix", i, r.From, r.CIDR)
 			}
 			c := cidr{prefix: pfx.Masked(), from: r.From}
+			byPort := cidrByPort
+			if originate {
+				byPort = spiffeCIDRByPort
+			}
 			if len(rulePorts) == 0 {
-				cidrByPort[0] = append(cidrByPort[0], c)
+				byPort[0] = append(byPort[0], c)
 			}
 			for _, p := range rulePorts {
-				cidrByPort[p] = append(cidrByPort[p], c)
+				byPort[p] = append(byPort[p], c)
 				ports[p] = true
 			}
 		default:
@@ -186,28 +233,48 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 	// A cidr rule for every port also holds on each port another chain names.
 	for p := range ports {
 		cidrByPort[p] = append(cidrByPort[p], cidrByPort[0]...)
+		spiffeCIDRByPort[p] = append(spiffeCIDRByPort[p], spiffeCIDRByPort[0]...)
+	}
+	// The same address and port cannot be both spliced and originated.
+	for p, cs := range spiffeCIDRByPort {
+		for _, c := range cs {
+			for _, o := range cidrByPort[p] {
+				if o.prefix == c.prefix {
+					return nil, fmt.Errorf("%s and %s: the same destination with and without tls", c.from, o.from)
+				}
+			}
+		}
+	}
+	spiffe, err := spiffeTLS(in, anyOriginate, opt)
+	if err != nil {
+		return nil, err
 	}
 
 	var chains []obj
-	for _, p := range sortedKeys(cidrByPort) {
-		cs := cidrByPort[p]
-		if len(cs) == 0 {
-			continue
+	for _, kind := range []struct {
+		name, cluster string
+		byPort        map[int][]cidr
+	}{{"cidr", originalDstCluster, cidrByPort}, {"cidr-spiffe", originalDstSPIFFECluster, spiffeCIDRByPort}} {
+		for _, p := range sortedKeys(kind.byPort) {
+			cs := kind.byPort[p]
+			if len(cs) == 0 {
+				continue
+			}
+			match := obj{"prefix_ranges": prefixRanges(cs)}
+			if p != 0 {
+				match["destination_port"] = p
+			}
+			chains = append(chains, obj{
+				"name":               chainName(kind.name, p),
+				"filter_chain_match": match,
+				"filters": []obj{{
+					"name": "envoy.filters.network.tcp_proxy",
+					"typed_config": typed("envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy", obj{
+						"stat_prefix": kind.name, "cluster": kind.cluster, "access_log": stdoutLog,
+					}),
+				}},
+			})
 		}
-		match := obj{"prefix_ranges": prefixRanges(cs)}
-		if p != 0 {
-			match["destination_port"] = p
-		}
-		chains = append(chains, obj{
-			"name":               chainName("cidr", p),
-			"filter_chain_match": match,
-			"filters": []obj{{
-				"name": "envoy.filters.network.tcp_proxy",
-				"typed_config": typed("envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy", obj{
-					"stat_prefix": "cidr", "cluster": originalDstCluster, "access_log": stdoutLog,
-				}),
-			}},
-		})
 	}
 	for _, p := range sortedKeys(tlsHosts) {
 		chains = append(chains, obj{
@@ -232,7 +299,7 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 		})
 	}
 	for _, p := range sortedKeys(httpHosts) {
-		chains = append(chains, httpChain(p, dedupe(httpHosts[p])))
+		chains = append(chains, httpChain(p, dedupe(httpHosts[p]), spiffeHosts[p]))
 	}
 	for _, ic := range icepts {
 		chains = append(chains, ic.chain())
@@ -243,6 +310,9 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 	}
 	if len(icepts) > 0 {
 		clusters = append(clusters, dfpClusterDef(dfpTLSCluster, &opt))
+	}
+	if spiffe != nil {
+		clusters = append(clusters, spiffe.clusters()...)
 	}
 
 	bootstrap := obj{
@@ -260,7 +330,7 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 			"clusters": clusters,
 		},
 	}
-	if len(icepts) > 0 {
+	if len(icepts) > 0 || spiffe != nil {
 		// SDS needs a node identity.
 		bootstrap["node"] = obj{"id": "kubeswift-sandbox", "cluster": "kubeswift-egress"}
 	}
@@ -303,6 +373,99 @@ func dfpClusterDef(name string, tls *Options) obj {
 		}
 	}
 	return c
+}
+
+// spiffeOrigination is the TLS Envoy originates with the sandbox's SVID.
+type spiffeOrigination struct {
+	socket, trustDomain string
+	opt                 Options
+}
+
+// spiffeTLS checks the intent's SPIFFE identity when a rule needs it.
+func spiffeTLS(in *v1.EgressIntent, needed bool, opt Options) (*spiffeOrigination, error) {
+	if !needed {
+		return nil, nil
+	}
+	if in.Identity == nil || in.Identity.SPIFFE == nil {
+		return nil, fmt.Errorf("rules with tls need identity.spiffe")
+	}
+	sp := in.Identity.SPIFFE
+	socket, ok := strings.CutPrefix(sp.WorkloadAPISocket, "unix://")
+	if !ok || !filepath.IsAbs(socket) {
+		return nil, fmt.Errorf("identity.spiffe.workloadAPISocket %q is not unix:///<absolute path>", sp.WorkloadAPISocket)
+	}
+	rest, ok := strings.CutPrefix(sp.ID, "spiffe://")
+	td, _, _ := strings.Cut(rest, "/")
+	if !ok || td == "" {
+		return nil, fmt.Errorf("identity.spiffe.id %q has no trust domain", sp.ID)
+	}
+	return &spiffeOrigination{socket: socket, trustDomain: td, opt: opt}, nil
+}
+
+func (s *spiffeOrigination) sds(name string) obj {
+	return obj{"name": name, "sds_config": obj{
+		"resource_api_version": "V3",
+		"api_config_source": obj{
+			"api_type": "GRPC", "transport_api_version": "V3",
+			"grpc_services": []obj{{"envoy_grpc": obj{"cluster_name": spiffeAgentCluster}}},
+		},
+	}}
+}
+
+// transportSocket presents the SVID and accepts an upstream SVID of the
+// trust domain only.
+func (s *spiffeOrigination) transportSocket() obj {
+	return obj{
+		"name": "envoy.transport_sockets.tls",
+		"typed_config": typed("envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext", obj{
+			"common_tls_context": obj{
+				"tls_certificate_sds_secret_configs": []obj{s.sds(s.opt.SVIDName)},
+				"combined_validation_context": obj{
+					"default_validation_context": obj{"match_typed_subject_alt_names": []obj{{
+						"san_type": "URI", "matcher": obj{"prefix": "spiffe://" + s.trustDomain + "/"},
+					}}},
+					"validation_context_sds_secret_config": s.sds(s.opt.BundleName),
+				},
+			},
+		}),
+	}
+}
+
+func (s *spiffeOrigination) clusters() []obj {
+	od := obj{"name": originalDstSPIFFECluster, "type": "ORIGINAL_DST", "lb_policy": "CLUSTER_PROVIDED", "connect_timeout": "5s",
+		"transport_socket": s.transportSocket()}
+	dfp := dfpClusterDef(dfpSPIFFECluster, nil)
+	// An SVID carries a URI SAN, no DNS name, so Envoy's name check
+	// (auto_san_validation) cannot pass; the trust-domain URI SAN match in
+	// the transport socket is the check, and the option that lets the
+	// cluster go without the name check is set for this cluster only.
+	dfp["cluster_type"] = obj{
+		"name": "envoy.clusters.dynamic_forward_proxy",
+		"typed_config": typed("envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig", obj{
+			"dns_cache_config": dnsCache, "allow_insecure_cluster_options": true,
+		}),
+	}
+	dfp["transport_socket"] = s.transportSocket()
+	// SNI from the Host; the SAN is checked against the trust domain, not
+	// the name.
+	dfp["typed_extension_protocol_options"] = obj{
+		"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": typed("envoy.extensions.upstreams.http.v3.HttpProtocolOptions", obj{
+			"upstream_http_protocol_options": obj{"auto_sni": true},
+			"explicit_http_config":           obj{"http_protocol_options": obj{}},
+		}),
+	}
+	agent := obj{
+		"name": spiffeAgentCluster, "type": "STATIC", "connect_timeout": "1s",
+		"typed_extension_protocol_options": obj{
+			"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": typed("envoy.extensions.upstreams.http.v3.HttpProtocolOptions", obj{
+				"explicit_http_config": obj{"http2_protocol_options": obj{}},
+			}),
+		},
+		"load_assignment": obj{"cluster_name": spiffeAgentCluster, "endpoints": []obj{{"lb_endpoints": []obj{{
+			"endpoint": obj{"address": obj{"pipe": obj{"path": s.socket}}},
+		}}}}},
+	}
+	return []obj{od, dfp, agent}
 }
 
 var credName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -505,16 +668,20 @@ func remove(s []string, x string) []string {
 // httpChain serves plain HTTP on port p: a virtual host per allowed host
 // (the Host header, with the port unless it is 80), forwarded to the name's
 // address; any other Host gets 403.
-func httpChain(p int, hosts []string) obj {
+func httpChain(p int, hosts []string, spiffe map[string]bool) obj {
 	var vhosts []obj
 	for _, h := range hosts {
+		cluster := dfpCluster
+		if spiffe[h] {
+			cluster = dfpSPIFFECluster
+		}
 		domains := []string{h + ":" + strconv.Itoa(p)}
 		if p == defaultHTTPPort {
 			domains = []string{h, h + ":80"}
 		}
 		vhosts = append(vhosts, obj{
 			"name": "host-" + h, "domains": domains,
-			"routes": []obj{{"match": obj{"prefix": "/"}, "route": obj{"cluster": dfpCluster}}},
+			"routes": []obj{{"match": obj{"prefix": "/"}, "route": obj{"cluster": cluster}}},
 		})
 	}
 	vhosts = append(vhosts, obj{

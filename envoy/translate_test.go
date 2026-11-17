@@ -53,7 +53,7 @@ func render(t *testing.T, in *v1.EgressIntent, opt Options) []byte {
 // (go test ./envoy -update rewrites them; hack/validate-envoy.sh loads the
 // translator's real output in Envoy).
 func TestGolden(t *testing.T) {
-	for _, name := range []string{"basic", "cidr-any-port", "credentials"} {
+	for _, name := range []string{"basic", "cidr-any-port", "credentials", "spiffe"} {
 		t.Run(name, func(t *testing.T) {
 			got := render(t, load(t, "testdata/"+name+".intent.json"), Options{Dir: goldenDir, AdminPort: 15000})
 			golden := "testdata/" + name + ".golden.json"
@@ -148,10 +148,10 @@ func TestHostWithoutPorts(t *testing.T) {
 // What the translator cannot honour fails loudly instead of being dropped.
 func TestRefusals(t *testing.T) {
 	for name, in := range map[string]*v1.EgressIntent{
-		"dns listener":    func() *v1.EgressIntent { i := intent(); i.Listeners.DNS = 15053; return i }(),
-		"tls origination": intent(v1.Rule{CIDR: "10.0.0.1/32", TLS: &v1.RuleTLS{Originate: "SPIFFE"}, From: "x"}),
-		"wrong version":   func() *v1.EgressIntent { i := intent(); i.APIVersion = "egress-intent.kubeswift.io/v2"; return i }(),
-		"ipv6 cidr":       intent(v1.Rule{CIDR: "fd00::/8", From: "x"}),
+		"dns listener":         func() *v1.EgressIntent { i := intent(); i.Listeners.DNS = 15053; return i }(),
+		"tls without identity": intent(v1.Rule{CIDR: "10.0.0.1/32", TLS: &v1.RuleTLS{Originate: "SPIFFE"}, From: "x"}),
+		"wrong version":        func() *v1.EgressIntent { i := intent(); i.APIVersion = "egress-intent.kubeswift.io/v2"; return i }(),
+		"ipv6 cidr":            intent(v1.Rule{CIDR: "fd00::/8", From: "x"}),
 	} {
 		if _, err := Translate(in, Options{Dir: goldenDir}); err == nil {
 			t.Errorf("%s: translated, want an error", name)
@@ -222,5 +222,102 @@ func TestCredentialRefusals(t *testing.T) {
 		in.Credentials[0].HeaderValueFile = ""
 	}), Options{Dir: goldenDir}); err != nil {
 		t.Errorf("template {}: %v", err)
+	}
+}
+
+func spiffeIntent(rules ...v1.Rule) *v1.EgressIntent {
+	in := intent(rules...)
+	in.Identity = &v1.Identity{SPIFFE: &v1.SPIFFE{
+		WorkloadAPISocket: "unix:///run/spiffe/spire-agent.sock",
+		ID:                "spiffe://kubeswift.test/ns/a/pool/p/slot/p-x",
+	}}
+	return in
+}
+
+// A cidr rule with tls gets its own chain to the SPIFFE ORIGINAL_DST
+// cluster; a host rule with tls is served as plain HTTP and routed to the
+// SPIFFE dynamic forward proxy. Both clusters present the SVID from SDS and
+// accept only an upstream SVID of the trust domain.
+func TestSPIFFEOrigination(t *testing.T) {
+	tls := &v1.RuleTLS{Originate: "SPIFFE"}
+	in := spiffeIntent(
+		v1.Rule{CIDR: "10.96.0.12/32", Ports: tcp(8443), TLS: tls, From: "service ai/llm"},
+		v1.Rule{CIDR: "10.96.0.13/32", Ports: tcp(8443), From: "service ai/plain"},
+		v1.Rule{Host: "mcp.example.com", Ports: tcp(8080), TLS: tls, From: "host mcp.example.com"},
+		v1.Rule{Host: "api.example.com", Ports: tcp(8080), From: "host api.example.com"},
+	)
+	files, err := Translate(in, Options{Dir: goldenDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := string(files[BootstrapFile])
+	for _, want := range []string{
+		`"name": "cidr-spiffe-8443"`, `"cluster": "original_dst_spiffe"`,
+		`"cluster": "dynamic_forward_proxy_spiffe"`, `"prefix": "spiffe://kubeswift.test/"`,
+		`"path": "/run/spiffe/spire-agent.sock"`, `"name": "default"`, `"name": "ROOTCA"`,
+		`"id": "kubeswift-sandbox"`,
+	} {
+		if !strings.Contains(b, want) {
+			t.Errorf("bootstrap lacks %s", want)
+		}
+	}
+	cs := chains(t, in)
+	if _, ok := cs["cidr-8443"]; !ok {
+		t.Error("the plain cidr rule lost its chain")
+	}
+	// The vhost of the tls host routes to the SPIFFE cluster, the other one
+	// to the plain forward proxy.
+	var routes map[string]string
+	var raw map[string]any
+	if err := json.Unmarshal(files[BootstrapFile], &raw); err != nil {
+		t.Fatal(err)
+	}
+	routes = map[string]string{}
+	for _, fc := range raw["static_resources"].(map[string]any)["listeners"].([]any)[0].(map[string]any)["filter_chains"].([]any) {
+		f := fc.(map[string]any)
+		if f["name"] != "http-8080" {
+			continue
+		}
+		hcm := f["filters"].([]any)[0].(map[string]any)["typed_config"].(map[string]any)
+		for _, vh := range hcm["route_config"].(map[string]any)["virtual_hosts"].([]any) {
+			v := vh.(map[string]any)
+			r := v["routes"].([]any)[0].(map[string]any)
+			if rt, ok := r["route"].(map[string]any); ok {
+				routes[v["name"].(string)] = rt["cluster"].(string)
+			}
+		}
+	}
+	if routes["host-mcp.example.com"] != "dynamic_forward_proxy_spiffe" || routes["host-api.example.com"] != "dynamic_forward_proxy" {
+		t.Errorf("routes %v", routes)
+	}
+	// No tls rule, no SPIFFE clusters even with an identity.
+	files, err = Translate(spiffeIntent(v1.Rule{CIDR: "10.0.0.1/32", From: "x"}), Options{Dir: goldenDir})
+	if err != nil || strings.Contains(string(files[BootstrapFile]), "spiffe") {
+		t.Errorf("identity without tls rules: %v", err)
+	}
+}
+
+func TestSPIFFERefusals(t *testing.T) {
+	tls := &v1.RuleTLS{Originate: "SPIFFE"}
+	for name, in := range map[string]*v1.EgressIntent{
+		"host without ports": spiffeIntent(v1.Rule{Host: "mcp.example.com", TLS: tls, From: "x"}),
+		"not SPIFFE":         spiffeIntent(v1.Rule{CIDR: "10.0.0.1/32", TLS: &v1.RuleTLS{Originate: "X509"}, From: "x"}),
+		"same destination twice": spiffeIntent(
+			v1.Rule{CIDR: "10.0.0.1/32", Ports: tcp(443), TLS: tls, From: "a"},
+			v1.Rule{CIDR: "10.0.0.1/32", Ports: tcp(443), From: "b"}),
+		"tcp socket": func() *v1.EgressIntent {
+			i := spiffeIntent(v1.Rule{CIDR: "10.0.0.1/32", TLS: tls, From: "x"})
+			i.Identity.SPIFFE.WorkloadAPISocket = "tcp://127.0.0.1:8081"
+			return i
+		}(),
+		"no id": func() *v1.EgressIntent {
+			i := spiffeIntent(v1.Rule{CIDR: "10.0.0.1/32", TLS: tls, From: "x"})
+			i.Identity.SPIFFE.ID = ""
+			return i
+		}(),
+	} {
+		if _, err := Translate(in, Options{Dir: goldenDir}); err == nil {
+			t.Errorf("%s: translated, want an error", name)
+		}
 	}
 }

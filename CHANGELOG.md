@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- SPIFFE TLS origination in the Envoy translator (`rule.tls`, KubeSwift's
+  `allow[].tls`): the guest speaks plaintext and Envoy connects over TLS with
+  the sandbox's X.509-SVID, read over SDS from the agent at
+  `identity.spiffe.workloadAPISocket`, accepting only an upstream SVID of the
+  sandbox's trust domain. Address rules use an `ORIGINAL_DST` cluster; host
+  rules (which need ports) are served as plain HTTP and forwarded with SNI.
+  `--spiffe-svid-name` / `--spiffe-bundle-name` (default SPIRE's `default` and
+  `ROOTCA`).
+- The image declares `io.kubeswift.egress-intent.features="tls-originate"`;
+  KubeSwift requires it before writing `rule.tls`.
+
+### Changed
+
+- `intent/v1` pinned to kubeswift-io/kubeswift@42b7e8b8: `identity.spiffe.id`.
+
 ## [v0.2.0] - 2026-11-17
 
 Credentials in the Envoy translator, for KubeSwift egress credentials.

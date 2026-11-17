@@ -48,6 +48,8 @@ func run(args []string) error {
 	out := fs.String("out", "", "where to write the Envoy bootstrap; SDS files go next to it")
 	admin := fs.Int("admin-port", 0, "open Envoy's admin endpoint on 127.0.0.1:N")
 	upstreamCA := fs.String("upstream-ca", "", "CA bundle for intercepted upstreams (default the Envoy image's)")
+	svidName := fs.String("spiffe-svid-name", "", `SDS name of the sandbox's SVID at the SPIFFE agent (default "default", SPIRE's)`)
+	bundleName := fs.String("spiffe-bundle-name", "", `SDS name of the trust domain's bundle at the SPIFFE agent (default "ROOTCA", SPIRE's)`)
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -66,7 +68,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	files, err := envoy.Translate(&in, envoy.Options{Dir: dir, AdminPort: *admin, UpstreamCA: *upstreamCA})
+	files, err := envoy.Translate(&in, envoy.Options{Dir: dir, AdminPort: *admin, UpstreamCA: *upstreamCA, SVIDName: *svidName, BundleName: *bundleName})
 	if err != nil {
 		return err
 	}
