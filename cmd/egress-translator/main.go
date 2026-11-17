@@ -6,6 +6,7 @@
 // into a volume the proxy reads.
 //
 //	egress-translator envoy [--intent PATH] --out PATH [--admin-port N] [--upstream-ca PATH]
+//	egress-translator agentgateway [--intent PATH] --out PATH [--admin-port N]
 //
 // --out names the bootstrap; SDS files for credentials are written next to
 // it. --admin-port opens Envoy's admin endpoint on 127.0.0.1 (a preset's
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/kubeswift-io/kubeswift-egress-adapters/agentgateway"
 	"github.com/kubeswift-io/kubeswift-egress-adapters/envoy"
 	v1 "github.com/kubeswift-io/kubeswift-egress-adapters/intent/v1"
 )
@@ -36,15 +38,14 @@ func main() {
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "agentgateway" {
+		return runAgentgateway(args[1:])
+	}
 	if len(args) == 0 || args[0] != "envoy" {
-		return fmt.Errorf("usage: egress-translator envoy [--intent PATH] --out PATH")
+		return fmt.Errorf("usage: egress-translator envoy|agentgateway [--intent PATH] --out PATH")
 	}
 	fs := flag.NewFlagSet("envoy", flag.ContinueOnError)
-	def := os.Getenv("KUBESWIFT_EGRESS_INTENT")
-	if def == "" {
-		def = v1.Path
-	}
-	intentPath := fs.String("intent", def, "egress-intent file")
+	intentPath := fs.String("intent", defaultIntent(), "egress-intent file")
 	out := fs.String("out", "", "where to write the Envoy bootstrap; SDS files go next to it")
 	admin := fs.Int("admin-port", 0, "open Envoy's admin endpoint on 127.0.0.1:N")
 	upstreamCA := fs.String("upstream-ca", "", "CA bundle for intercepted upstreams (default the Envoy image's)")
@@ -56,19 +57,15 @@ func run(args []string) error {
 	if *out == "" {
 		return fmt.Errorf("--out is required")
 	}
-	raw, err := os.ReadFile(*intentPath)
+	in, err := readIntent(*intentPath)
 	if err != nil {
 		return err
-	}
-	var in v1.EgressIntent
-	if err := json.Unmarshal(raw, &in); err != nil {
-		return fmt.Errorf("%s: %w", *intentPath, err)
 	}
 	dir, err := filepath.Abs(filepath.Dir(*out))
 	if err != nil {
 		return err
 	}
-	files, err := envoy.Translate(&in, envoy.Options{Dir: dir, AdminPort: *admin, UpstreamCA: *upstreamCA, SVIDName: *svidName, BundleName: *bundleName})
+	files, err := envoy.Translate(in, envoy.Options{Dir: dir, AdminPort: *admin, UpstreamCA: *upstreamCA, SVIDName: *svidName, BundleName: *bundleName})
 	if err != nil {
 		return err
 	}
@@ -91,6 +88,52 @@ func run(args []string) error {
 		return err
 	}
 	fmt.Printf("egress-translator: %s (%d allow rules, %d credentials) -> %s\n", *intentPath, len(in.Allow), len(in.Credentials), *out)
+	return nil
+}
+
+func defaultIntent() string {
+	if p := os.Getenv("KUBESWIFT_EGRESS_INTENT"); p != "" {
+		return p
+	}
+	return v1.Path
+}
+
+func readIntent(path string) (*v1.EgressIntent, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var in v1.EgressIntent
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &in, nil
+}
+
+func runAgentgateway(args []string) error {
+	fs := flag.NewFlagSet("agentgateway", flag.ContinueOnError)
+	intentPath := fs.String("intent", defaultIntent(), "egress-intent file")
+	out := fs.String("out", "", "where to write the agentgateway configuration (JSON)")
+	admin := fs.Int("admin-port", 0, "agentgateway's admin endpoint on 127.0.0.1:N (default 15000)")
+	ready := fs.Int("readiness-port", 0, "agentgateway's readiness endpoint on 127.0.0.1:N (default 15021)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("--out is required")
+	}
+	in, err := readIntent(*intentPath)
+	if err != nil {
+		return err
+	}
+	files, err := agentgateway.Translate(in, agentgateway.Options{AdminPort: *admin, ReadinessPort: *ready})
+	if err != nil {
+		return err
+	}
+	if err := write(*out, files[agentgateway.ConfigFile]); err != nil {
+		return err
+	}
+	fmt.Printf("egress-translator: %s (%d allow rules) -> %s\n", *intentPath, len(in.Allow), *out)
 	return nil
 }
 

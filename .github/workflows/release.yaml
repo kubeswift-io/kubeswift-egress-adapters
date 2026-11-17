@@ -12,6 +12,7 @@ permissions:
 
 env:
   IMAGE: ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator
+  AGW_IMAGE: ghcr.io/kubeswift-io/kubeswift-egress-adapters/agentgateway-translator
 
 jobs:
   release:
@@ -38,6 +39,7 @@ jobs:
             ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/validate-envoy.sh
             ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/e2e-envoy-credentials.sh
           done
+          AGENTGATEWAY_IMAGE=cr.agentgateway.dev/agentgateway:v1.7.0 ./hack/validate-agentgateway.sh
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -57,16 +59,28 @@ jobs:
           sbom: true
           tags: ${{ env.IMAGE }}:${{ github.ref_name }}
 
+      - name: Build and push agentgateway-translator
+        id: build-agw
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/agentgateway-translator/Containerfile
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.AGW_IMAGE }}:${{ github.ref_name }}
+
       # KubeSwift refuses a translator whose image does not declare the intent
       # versions it reads (EgressIntentUnsupported), so check the pushed image.
       # With provenance attached the push is an index, keyed by platform.
       - name: Check the intent-versions label
         run: |
           set -euo pipefail
-          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
-          v=$(docker buildx imagetools inspect "$ref" --format '{{ json .Image }}' | jq -r '(if has("config") then . else .["linux/amd64"] end).config.Labels["io.kubeswift.egress-intent.versions"] // empty')
-          [ "$v" = v1 ] || { echo "::error::$ref has io.kubeswift.egress-intent.versions=\"$v\", want v1"; exit 1; }
-          echo "$ref: io.kubeswift.egress-intent.versions=$v"
+          for ref in "${IMAGE}@${{ steps.build.outputs.digest }}" "${AGW_IMAGE}@${{ steps.build-agw.outputs.digest }}"; do
+            v=$(docker buildx imagetools inspect "$ref" --format '{{ json .Image }}' | jq -r '(if has("config") then . else .["linux/amd64"] end).config.Labels["io.kubeswift.egress-intent.versions"] // empty')
+            [ "$v" = v1 ] || { echo "::error::$ref has io.kubeswift.egress-intent.versions=\"$v\", want v1"; exit 1; }
+            echo "$ref: io.kubeswift.egress-intent.versions=$v"
+          done
 
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
@@ -81,12 +95,13 @@ jobs:
           COSIGN_YES: "true"
         run: |
           set -euo pipefail
-          ref="${IMAGE}@${{ steps.build.outputs.digest }}"
-          cosign sign "$ref"
-          cosign verify "$ref" \
-            --certificate-identity-regexp '^https://github\.com/kubeswift-io/kubeswift-egress-adapters/\.github/workflows/release\.yaml@refs/tags/v.*$' \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
-          echo "$ref signed and verified"
+          for ref in "${IMAGE}@${{ steps.build.outputs.digest }}" "${AGW_IMAGE}@${{ steps.build-agw.outputs.digest }}"; do
+            cosign sign "$ref"
+            cosign verify "$ref" \
+              --certificate-identity-regexp '^https://github\.com/kubeswift-io/kubeswift-egress-adapters/\.github/workflows/release\.yaml@refs/tags/v.*$' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+            echo "$ref signed and verified"
+          done
 
       - name: GitHub release
         env:
@@ -95,6 +110,8 @@ jobs:
           set -euo pipefail
           {
             cat "$RUNNER_TEMP/notes.md"
-            printf '\n### Image\n\n```\n%s:%s\n%s@%s\n```\n' "$IMAGE" "$GITHUB_REF_NAME" "$IMAGE" "${{ steps.build.outputs.digest }}"
+            printf '\n### Images\n\n```\n%s:%s\n%s@%s\n%s:%s\n%s@%s\n```\n' \
+              "$IMAGE" "$GITHUB_REF_NAME" "$IMAGE" "${{ steps.build.outputs.digest }}" \
+              "$AGW_IMAGE" "$GITHUB_REF_NAME" "$AGW_IMAGE" "${{ steps.build-agw.outputs.digest }}"
           } > "$RUNNER_TEMP/body.md"
           gh release create "$GITHUB_REF_NAME" --title "kubeswift-egress-adapters $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/body.md" --verify-tag

@@ -1,0 +1,72 @@
+{
+  "binds": [
+    {
+      "listeners": [
+        {
+          "hostname": "*",
+          "name": "tls",
+          "protocol": "TLS",
+          "tcpRoutes": [
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "destination.port in [443] ? destination.hostname + \":\" + string(destination.port) : \"127.0.0.1:9\""
+                  }
+                }
+              ],
+              "hostnames": [
+                "api.github.com"
+              ],
+              "name": "host-0"
+            }
+          ]
+        },
+        {
+          "name": "http",
+          "protocol": "HTTP",
+          "routes": [
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "request.host + \":\" + string(destination.port)"
+                  }
+                }
+              ],
+              "hostnames": [
+                "api.github.com"
+              ],
+              "name": "host-0",
+              "policies": {
+                "authorization": {
+                  "rules": [
+                    {
+                      "allow": "destination.port in [80]"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "port": 15006,
+      "protocol": "AUTO"
+    }
+  ],
+  "config": {
+    "adminAddr": "127.0.0.1:15000",
+    "readinessAddr": "127.0.0.1:15021",
+    "session": {
+      "key": "disabled"
+    },
+    "statsAddr": "off"
+  },
+  "frontendPolicies": {
+    "proxyProtocol": {
+      "mode": "strict",
+      "version": "v1"
+    }
+  }
+}

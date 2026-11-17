@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- agentgateway translator (`egress-translator agentgateway`, image
+  `agentgateway-translator`): a static configuration for an unmodified
+  agentgateway behind KubeSwift's PROXY protocol relay
+  (`listeners.proxyProtocol`, required, `mode: strict`). Host rules by TLS
+  server name and HTTP `Host`, connecting to the name; cidr rules by original
+  destination for TLS, HTTP and TCP; everything else closed. Refuses
+  credentials, `rule.tls` and the DNS and HTTP listeners. The image declares
+  `io.kubeswift.egress-intent.features="proxy-protocol"`.
+  `hack/validate-agentgateway.sh` loads every golden output in a real
+  agentgateway (CI, v1.7.0).
+
+### Changed
+
+- `intent/v1`: `listeners.proxyProtocol` and the `proxy-protocol` feature.
+
 ## [v0.3.0] - 2026-11-17
 
 SPIFFE TLS origination in the Envoy translator, for KubeSwift's `allow[].tls`.

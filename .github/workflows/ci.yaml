@@ -25,6 +25,10 @@ jobs:
       - name: envoy --mode validate
         run: |
           for v in v1.36.2 v1.35.6; do ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/validate-envoy.sh; done
+      # Every golden agentgateway translation must load in a real agentgateway.
+      - name: agentgateway --validate-only
+        run: |
+          for v in v1.7.0; do AGENTGATEWAY_IMAGE=cr.agentgateway.dev/agentgateway:$v ./hack/validate-agentgateway.sh; done
       # The credential path end to end: translator + Envoy + a TLS upstream.
       - name: credentials behaviour
         run: |
@@ -39,4 +43,9 @@ jobs:
         with:
           context: .
           file: images/envoy-translator/Containerfile
+          push: false
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/agentgateway-translator/Containerfile
           push: false

@@ -6,6 +6,7 @@ WORKDIR /src
 COPY go.mod ./
 COPY intent ./intent
 COPY envoy ./envoy
+COPY agentgateway ./agentgateway
 COPY cmd ./cmd
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/egress-translator ./cmd/egress-translator
 

@@ -1,0 +1,9 @@
+{
+  "apiVersion": "egress-intent.kubeswift.io/v1",
+  "kind": "EgressIntent",
+  "owner": {"namespace": "team-a", "kind": "SwiftSandboxPool", "name": "agents"},
+  "listeners": {"transparent": 15006, "proxyProtocol": "v1"},
+  "allow": [
+    {"host": "api.github.com", "from": "host api.github.com"}
+  ]
+}

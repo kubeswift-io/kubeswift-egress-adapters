@@ -1,1 +1,1 @@
-kubeswift-io/kubeswift@42b7e8b8 api/egressintent/v1/egress-intent.schema.json
+kubeswift-io/kubeswift@feat/egress-proxy-protocol api/egressintent/v1/egress-intent.schema.json

@@ -1,0 +1,159 @@
+{
+  "binds": [
+    {
+      "listeners": [
+        {
+          "hostname": "*",
+          "name": "tls",
+          "protocol": "TLS",
+          "tcpRoutes": [
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "destination.port in [80, 443] ? destination.hostname + \":\" + string(destination.port) : \"127.0.0.1:9\""
+                  }
+                }
+              ],
+              "hostnames": [
+                "example.com"
+              ],
+              "name": "host-0"
+            },
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "destination.port in [443] ? destination.hostname + \":\" + string(destination.port) : \"127.0.0.1:9\""
+                  }
+                }
+              ],
+              "hostnames": [
+                "*.example.com"
+              ],
+              "name": "host-1"
+            },
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "(cidr(\"10.96.0.12/32\").containsIP(destination.address) && destination.port in [8080]) || cidr(\"203.0.113.0/24\").containsIP(destination.address) ? destination.address + \":\" + string(destination.port) : \"127.0.0.1:9\""
+                  }
+                }
+              ],
+              "name": "address"
+            }
+          ]
+        },
+        {
+          "name": "http",
+          "protocol": "HTTP",
+          "routes": [
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "request.host + \":\" + string(destination.port)"
+                  }
+                }
+              ],
+              "hostnames": [
+                "example.com"
+              ],
+              "name": "host-0",
+              "policies": {
+                "authorization": {
+                  "rules": [
+                    {
+                      "allow": "destination.port in [80, 443]"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "request.host + \":\" + string(destination.port)"
+                  }
+                }
+              ],
+              "hostnames": [
+                "*.example.com"
+              ],
+              "name": "host-1",
+              "policies": {
+                "authorization": {
+                  "rules": [
+                    {
+                      "allow": "destination.port in [80]"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "destination.address + \":\" + string(destination.port)"
+                  }
+                }
+              ],
+              "matches": [
+                {
+                  "path": {
+                    "pathPrefix": "/"
+                  }
+                }
+              ],
+              "name": "address",
+              "policies": {
+                "authorization": {
+                  "rules": [
+                    {
+                      "allow": "(cidr(\"10.96.0.12/32\").containsIP(destination.address) && destination.port in [8080]) || cidr(\"203.0.113.0/24\").containsIP(destination.address)"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "tcp",
+          "protocol": "TCP",
+          "tcpRoutes": [
+            {
+              "backends": [
+                {
+                  "dynamic": {
+                    "target": "(cidr(\"10.96.0.12/32\").containsIP(destination.address) && destination.port in [8080]) || cidr(\"203.0.113.0/24\").containsIP(destination.address) ? destination.address + \":\" + string(destination.port) : \"127.0.0.1:9\""
+                  }
+                }
+              ],
+              "name": "address"
+            }
+          ]
+        }
+      ],
+      "port": 15006,
+      "protocol": "AUTO"
+    }
+  ],
+  "config": {
+    "adminAddr": "127.0.0.1:15000",
+    "readinessAddr": "127.0.0.1:15021",
+    "session": {
+      "key": "disabled"
+    },
+    "statsAddr": "off"
+  },
+  "frontendPolicies": {
+    "proxyProtocol": {
+      "mode": "strict",
+      "version": "v2"
+    }
+  }
+}

@@ -12,9 +12,8 @@ upstream one, unchanged.
 
 | Translator | Proxy | Status |
 |---|---|---|
-| `envoy` | [Envoy](https://www.envoyproxy.io/) | first version |
-| `agentgateway` | [agentgateway](https://agentgateway.dev/) | planned |
-| `openshell` | OpenShell supervisor | planned |
+| `envoy` | [Envoy](https://www.envoyproxy.io/) | released |
+| `agentgateway` | [agentgateway](https://agentgateway.dev/) | first version |
 
 ## Envoy
 
@@ -41,18 +40,46 @@ credentials, an SDS file per certificate and credential next to it):
 lists the serial numbers of the certificates Envoy serves, which a KubeSwift
 preset's readiness probe checks after a swap.
 
+With `rule.tls` (KubeSwift's `allow[].tls`) Envoy originates SPIFFE mTLS with
+the sandbox's SVID, read over SDS from the agent's Workload API socket.
+
 Not supported yet, refused with an error: a DNS listener, an explicit HTTP
-listener, TLS origination and wildcard credential destinations.
+listener and wildcard credential destinations.
 
 The image is `ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator`
 and carries the label `io.kubeswift.egress-intent.versions=v1`.
 Release images are signed with cosign (keyless):
 
 ```bash
-cosign verify ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator:v0.1.0 \
+cosign verify ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator:<tag> \
   --certificate-identity-regexp '^https://github\.com/kubeswift-io/kubeswift-egress-adapters/\.github/workflows/release\.yaml@refs/tags/v.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+## agentgateway
+
+`egress-translator agentgateway --out /config/agentgateway.json` writes a
+static agentgateway configuration. agentgateway does not read
+`SO_ORIGINAL_DST`, so the preset must set `listeners.proxyProtocol` (a KubeSwift
+release after v0.25.1): KubeSwift then passes each guest connection through a relay
+that sends a PROXY protocol header with the original destination, and the
+configuration requires it (`mode: strict`). One bind on the transparent port:
+
+- TLS: a `host` rule matches the server name and connects to the name on the
+  port the guest asked for, if the rule allows it.
+- HTTP: a `host` rule matches the `Host` header and connects to the name.
+- `cidr` rules (Services arrive resolved) allow the original destination, for
+  TLS without a matching name, plain HTTP and any other TCP.
+- A `host` rule without ports allows TLS on 443 and HTTP on 80. Anything else
+  is closed.
+
+Refused with an error: an intent without `proxyProtocol`, DNS and HTTP
+listeners, credentials and `rule.tls`.
+
+The image is `ghcr.io/kubeswift-io/kubeswift-egress-adapters/agentgateway-translator`,
+with `io.kubeswift.egress-intent.features="proxy-protocol"`. `--admin-port`
+and `--readiness-port` move agentgateway's admin and readiness endpoints
+(127.0.0.1:15000 and :15021).
 
 ## The intent format
 
@@ -69,7 +96,9 @@ go test ./...                 # unit and golden tests
 go test ./envoy -update       # rewrite envoy/testdata/*.golden.json
 ./hack/validate-envoy.sh      # load the translator's output in a real Envoy (docker)
 ./hack/e2e-envoy-credentials.sh   # credential path end to end (docker)
+./hack/validate-agentgateway.sh   # load the agentgateway output in a real agentgateway (docker)
 docker build -f images/envoy-translator/Containerfile .
+docker build -f images/agentgateway-translator/Containerfile .
 ```
 
 ## License
