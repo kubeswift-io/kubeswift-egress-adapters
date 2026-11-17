@@ -35,6 +35,13 @@ listener, TLS origination and credentials.
 
 The image is `ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator`
 and carries the label `io.kubeswift.egress-intent.versions=v1`.
+Release images are signed with cosign (keyless):
+
+```bash
+cosign verify ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator:v0.1.0 \
+  --certificate-identity-regexp '^https://github\.com/kubeswift-io/kubeswift-egress-adapters/\.github/workflows/release\.yaml@refs/tags/v.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 ## The intent format
 
