@@ -34,6 +34,11 @@ const FeaturesLabel = "io.kubeswift.egress-intent.features"
 // plaintext (for a host rule, HTTP, matched by its Host header).
 const FeatureTLSOriginate = "tls-originate"
 
+// FeatureProxyProtocol: Listeners.ProxyProtocol. The proxy reads a PROXY
+// protocol header at the start of every connection on the transparent
+// listener and takes the original destination from it.
+const FeatureProxyProtocol = "proxy-protocol"
+
 // EgressIntent is the whole file.
 type EgressIntent struct {
 	// APIVersion is APIVersion.
@@ -87,6 +92,10 @@ type Listeners struct {
 	// HTTP, when set, is an explicit HTTP proxy (CONNECT and absolute-URI
 	// requests); the guest's HTTP_PROXY and HTTPS_PROXY point at it.
 	HTTP int32 `json:"http,omitempty"`
+	// ProxyProtocol ("v1" or "v2"): KubeSwift sends guest connections through
+	// a relay that starts each with a PROXY protocol header carrying the
+	// original destination; the proxy must require it.
+	ProxyProtocol string `json:"proxyProtocol,omitempty"`
 }
 
 // Rule allows one destination. Exactly one of Host and CIDR is set.
