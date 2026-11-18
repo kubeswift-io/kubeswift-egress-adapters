@@ -1,11 +1,9 @@
 # Changelog
 
-## [Unreleased]
+## [v0.5.0] - 2026-11-18
 
-### Changed
-
-- `intent/v1`: `rule.service` (the Service a cidr rule was resolved from);
-  schema pinned to kubeswift-io/kubeswift@414d6516.
+An explicit HTTP proxy listener for Envoy, for KubeSwift's network mode
+`brokered`.
 
 ### Added
 
@@ -19,6 +17,11 @@
   without DNS); anything else gets 403. Still refused with
   credentials or `rule.tls`. `hack/e2e-envoy-http.sh` checks the behaviour
   against a real Envoy (CI, v1.36.2 and v1.35.6).
+
+### Changed
+
+- `intent/v1`: `rule.service` (the Service a cidr rule was resolved from);
+  schema pinned to kubeswift-io/kubeswift@414d6516.
 
 ## [v0.4.0] - 2026-11-18
 
