@@ -358,3 +358,29 @@ func TestAuthorityRegex(t *testing.T) {
 		}
 	}
 }
+
+// A Service is matched by its names on its port: the bare name only in the
+// owner's namespace, never another name, namespace or port.
+func TestServiceAuthorityRegex(t *testing.T) {
+	sv := serviceRule{namespace: "ai", name: "llm", addr: "10.96.0.9", ports: []int{8080}}
+	for _, tc := range []struct {
+		owner string
+		match []string
+		miss  []string
+	}{
+		{"ai", []string{"llm:8080", "llm.ai:8080", "llm.ai.svc:8080", "llm.ai.svc.cluster.local:8080"}, []string{"llm:80", "llm.other:8080", "llmx:8080", "llm.ai.svc.:8080", "x.llm.ai:8080", "llm.ai.svc.cluster.local:8081"}},
+		{"team-a", []string{"llm.ai:8080"}, []string{"llm:8080"}},
+	} {
+		re := regexp.MustCompile("^(?:" + sv.authorityRegex(tc.owner, 8080) + ")$")
+		for _, a := range tc.match {
+			if !re.MatchString(a) {
+				t.Errorf("owner %s: %q not matched by %s", tc.owner, a, re)
+			}
+		}
+		for _, a := range tc.miss {
+			if re.MatchString(a) {
+				t.Errorf("owner %s: %q matched by %s", tc.owner, a, re)
+			}
+		}
+	}
+}

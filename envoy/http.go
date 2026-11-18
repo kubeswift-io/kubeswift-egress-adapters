@@ -4,6 +4,7 @@ package envoy
 
 import (
 	"net/netip"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +21,7 @@ import (
 // its prefix on an allowed port, and the rest is answered 403. A name never
 // reaches the catch-all routes: their expressions match dotted IPv4 literals
 // only.
-func httpProxyListener(port int, tlsHosts, httpHosts map[int][]string, cidrByPort map[int][]cidr) obj {
+func httpProxyListener(port int, ownerNS string, tlsHosts, httpHosts map[int][]string, cidrByPort map[int][]cidr, services []serviceRule) (obj, []obj) {
 	hostPorts := map[string]map[int]bool{}
 	for _, m := range []map[int][]string{tlsHosts, httpHosts} {
 		for p, hs := range m {
@@ -52,7 +53,24 @@ func httpProxyListener(port int, tlsHosts, httpHosts map[int][]string, cidrByPor
 		}
 	}
 
-	var routes []obj
+	var routes, clusters []obj
+	seen := map[string]bool{}
+	for _, sv := range services {
+		for _, p := range sv.ports {
+			cl := "service_" + sv.addr + "_" + strconv.Itoa(p)
+			if !seen[cl] {
+				seen[cl] = true
+				clusters = append(clusters, obj{
+					"name": cl, "type": "STATIC", "connect_timeout": "5s",
+					"load_assignment": obj{"cluster_name": cl, "endpoints": []obj{{"lb_endpoints": []obj{{
+						"endpoint": obj{"address": obj{"socket_address": obj{"address": sv.addr, "port_value": p}}},
+					}}}}},
+				})
+			}
+			re := sv.authorityRegex(ownerNS, p)
+			routes = append(routes, connectRouteTo(cl, &re), forwardRouteTo(cl, &re))
+		}
+	}
 	for _, p := range sortedKeys(cidrByPort) {
 		cs := cidrByPort[p]
 		if len(cs) == 0 {
@@ -88,26 +106,52 @@ func httpProxyListener(port int, tlsHosts, httpHosts map[int][]string, cidrByPor
 				}),
 			}},
 		}},
+	}, clusters
+}
+
+// serviceRule is a cidr rule resolved from a Service, with its ports.
+type serviceRule struct {
+	namespace, name, addr string
+	ports                 []int
+}
+
+// authorityRegex matches the Service's names on port: "name" when it is in
+// the owner's namespace, "name.ns", "name.ns.svc" and "name.ns.svc.<domain>"
+// (as KubeSwift's built-in broker accepts them).
+func (s serviceRule) authorityRegex(ownerNS string, port int) string {
+	n, ns := regexp.QuoteMeta(s.name), regexp.QuoteMeta(s.namespace)
+	names := []string{n + `\.` + ns, n + `\.` + ns + `\.svc`, n + `\.` + ns + `\.svc\.[a-z0-9]([-a-z0-9.]*[a-z0-9])?`}
+	if s.namespace == ownerNS {
+		names = append([]string{n}, names...)
 	}
+	portRE := ":" + strconv.Itoa(port)
+	if port == defaultHTTPPort {
+		portRE = "(:80)?"
+	}
+	return "(" + strings.Join(names, "|") + ")" + portRE
 }
 
 // connectRoute terminates a CONNECT request (optionally only for an
 // :authority matching re) and tunnels its bytes to the authority.
-func connectRoute(re *string) obj {
+func connectRoute(re *string) obj { return connectRouteTo(dfpCluster, re) }
+
+func connectRouteTo(cluster string, re *string) obj {
 	m := obj{"connect_matcher": obj{}}
 	authorityMatch(m, re)
 	return obj{"match": m, "route": obj{
-		"cluster":         dfpCluster,
+		"cluster":         cluster,
 		"upgrade_configs": []obj{{"upgrade_type": "CONNECT", "connect_config": obj{}}},
 	}}
 }
 
 // forwardRoute forwards any other request (optionally only for an
 // :authority matching re) to the authority.
-func forwardRoute(re *string) obj {
+func forwardRoute(re *string) obj { return forwardRouteTo(dfpCluster, re) }
+
+func forwardRouteTo(cluster string, re *string) obj {
 	m := obj{"prefix": "/"}
 	authorityMatch(m, re)
-	return obj{"match": m, "route": obj{"cluster": dfpCluster}}
+	return obj{"match": m, "route": obj{"cluster": cluster}}
 }
 
 func authorityMatch(m obj, re *string) {

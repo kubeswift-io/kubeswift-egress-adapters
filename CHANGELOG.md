@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `intent/v1`: `rule.service` (the Service a cidr rule was resolved from);
+  schema pinned to kubeswift-io/kubeswift@e4777c70.
+
 ### Added
 
 - Envoy: an explicit HTTP proxy listener for `listeners.http`, for KubeSwift's
@@ -9,7 +14,9 @@
   `HTTP_PROXY` clients in mode `proxied`. `CONNECT` tunnels and absolute-URI
   requests are matched by authority: a `host` rule by name and port (Envoy
   connects to the name's address), a `cidr` rule by a canonical IPv4 literal
-  in its prefix and on its ports; anything else gets 403. Still refused with
+  in its prefix and on its ports (and, for a rule resolved from a Service,
+  `rule.service`, by the Service's names, connecting to the rule's address
+  without DNS); anything else gets 403. Still refused with
   credentials or `rule.tls`. `hack/e2e-envoy-http.sh` checks the behaviour
   against a real Envoy (CI, v1.36.2 and v1.35.6).
 

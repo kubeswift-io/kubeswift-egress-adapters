@@ -49,7 +49,10 @@ the guest's `HTTP_PROXY` and `HTTPS_PROXY` name (in KubeSwift's network mode
 absolute-URI request is forwarded, both by the authority the guest asked for:
 a `host` rule matches name and port and Envoy connects to the name's address;
 a `cidr` rule matches an IPv4 literal (canonical dotted form only) in its
-prefix and on its ports; anything else gets 403.
+prefix and on its ports, and one resolved from a Service (`rule.service`)
+also matches the Service's names (`app`, `app.<ns>`, `app.<ns>.svc[.<domain>]`)
+and connects to the rule's address without resolving them; anything else
+gets 403.
 
 Not supported yet, refused with an error: a DNS listener, the HTTP listener
 together with credentials or `rule.tls`, and wildcard credential destinations.

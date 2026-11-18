@@ -6,7 +6,7 @@
   "allow": [
     {"host": "api.example.com", "ports": [{"port": 443, "protocol": "TCP"}], "from": "host api.example.com"},
     {"host": "*.githubusercontent.com", "from": "host *.githubusercontent.com"},
-    {"cidr": "10.96.14.7/32", "ports": [{"port": 8080, "protocol": "TCP"}], "from": "service ai/llm-gateway"},
+    {"cidr": "10.96.14.7/32", "ports": [{"port": 8080, "protocol": "TCP"}], "service": {"namespace": "ai", "name": "llm-gateway"}, "from": "service ai/llm-gateway"},
     {"cidr": "10.20.16.0/20", "from": "cidr 10.20.16.0/20"}
   ]
 }

@@ -9,7 +9,10 @@
 #     naming an allowed host on a request for another get 403;
 #   - an IPv4 literal reaches a cidr rule's address on its port only, and
 #     non-canonical spellings of that address (leading zeros, one decimal
-#     number, hex) get 403.
+#     number, hex) get 403;
+#   - the rule's Service is reached by its names (app, app.e2e, app.e2e.svc,
+#     app.e2e.svc.cluster.local) on its port only, connecting to the rule's
+#     address with no DNS; another name or namespace gets 403.
 set -euo pipefail
 ENVOY_IMAGE="${ENVOY_IMAGE:-docker.io/envoyproxy/envoy:v1.36.2}"
 PY_IMAGE="${PY_IMAGE:-docker.io/library/python:3.13-alpine}"
@@ -33,7 +36,7 @@ cat > "$work/intent.json" <<EOF
  "allow": [
   {"host": "$PUBLIC_HOST", "from": "host $PUBLIC_HOST"},
   {"host": "*.$PUBLIC_HOST", "ports": [{"port": 443, "protocol": "TCP"}], "from": "host *.$PUBLIC_HOST"},
-  {"cidr": "$up/32", "ports": [{"port": 8080, "protocol": "TCP"}], "from": "cidr upstream"}
+  {"cidr": "$up/32", "ports": [{"port": 8080, "protocol": "TCP"}], "service": {"namespace": "e2e", "name": "app"}, "from": "service e2e/app"}
  ]}
 EOF
 "$work/egress-translator" envoy --intent "$work/intent.json" --out "$work/out/envoy.json" >/dev/null
@@ -69,5 +72,13 @@ raw raw-leading-zeros block "${up%.*}.$(printf %03d "${up##*.}"):8080"
 raw raw-decimal block "$(IFS=. read -r a b c d <<<"$up"; echo $(( (a<<24) + (b<<16) + (c<<8) + d ))):8080"
 raw raw-hex block "$(printf '0x%x' "$o1").$rest:8080"
 raw raw-other-name block "$OTHER_HOST:443"
+get service-name reach "http://app:8080/"
+get service-name-ns reach "http://app.e2e:8080/"
+get service-name-svc-connect reach -p "http://app.e2e.svc:8080/"
+get service-fqdn-connect reach -p "http://app.e2e.svc.cluster.local:8080/"
+get service-other-port block "http://app:8081/"
+get service-other-namespace block "http://app.other:8080/"
+get service-other-name block "http://db:8080/"
+raw raw-service-name reach "app:8080"
 if [ $fail != 0 ]; then docker logs "$net-envoy" 2>&1 | tail -20 >&2; exit 1; fi
 echo "PASS: the HTTP listener allows only the allowlist, by name and canonical address"

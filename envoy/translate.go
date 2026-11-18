@@ -55,6 +55,11 @@
 //     allowed port (a regular expression on :authority), and Envoy connects
 //     to that address;
 //
+//   - a cidr rule resolved from a Service (rule.service) also matches the
+//     Service's names on its ports ("name" in the owner's namespace,
+//     "name.ns", "name.ns.svc", "name.ns.svc.<domain>"), and Envoy connects
+//     to the rule's address, never resolving the name;
+//
 //   - anything else is answered 403.
 //
 // Not supported, refused with an error: a DNS listener, the HTTP listener
@@ -171,6 +176,7 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 	cidrByPort := map[int][]cidr{}           // port 0: every port
 	spiffeCIDRByPort := map[int][]cidr{}
 	ports := map[int]bool{}
+	var services []serviceRule
 	anyOriginate := false
 	for i, r := range in.Allow {
 		originate := false
@@ -220,6 +226,9 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 				return nil, fmt.Errorf("allow[%d] (%s): cidr %q is not an IPv4 prefix", i, r.From, r.CIDR)
 			}
 			c := cidr{prefix: pfx.Masked(), from: r.From}
+			if r.Service != nil && pfx.Bits() == 32 && len(rulePorts) > 0 {
+				services = append(services, serviceRule{namespace: r.Service.Namespace, name: r.Service.Name, addr: pfx.Addr().String(), ports: rulePorts})
+			}
 			byPort := cidrByPort
 			if originate {
 				byPort = spiffeCIDRByPort
@@ -239,9 +248,11 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 		return nil, fmt.Errorf("listeners.http with a tls rule: this translator does not originate TLS on the HTTP listener yet")
 	}
 	files := map[string][]byte{}
-	var listeners []obj
+	var listeners, httpClusters []obj
 	if l.HTTP != 0 {
-		listeners = append(listeners, httpProxyListener(int(l.HTTP), tlsHosts, httpHosts, cidrByPort))
+		var hl obj
+		hl, httpClusters = httpProxyListener(int(l.HTTP), in.Owner.Namespace, tlsHosts, httpHosts, cidrByPort, services)
+		listeners = append(listeners, hl)
 	}
 	icepts, err := intercepts(in, tlsHosts, opt.Dir, files)
 	if err != nil {
@@ -337,6 +348,7 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 	if len(icepts) > 0 {
 		clusters = append(clusters, dfpClusterDef(dfpTLSCluster, &opt))
 	}
+	clusters = append(clusters, httpClusters...)
 	if spiffe != nil {
 		clusters = append(clusters, spiffe.clusters()...)
 	}
