@@ -38,6 +38,7 @@ jobs:
           for v in v1.36.2 v1.35.6; do
             ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/validate-envoy.sh
             ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/e2e-envoy-credentials.sh
+            ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/e2e-envoy-http.sh
           done
           AGENTGATEWAY_IMAGE=cr.agentgateway.dev/agentgateway:v1.7.0 ./hack/validate-agentgateway.sh
 

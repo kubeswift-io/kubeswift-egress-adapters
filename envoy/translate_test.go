@@ -5,8 +5,10 @@ package envoy
 import (
 	"encoding/json"
 	"flag"
+	"net/netip"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -53,7 +55,7 @@ func render(t *testing.T, in *v1.EgressIntent, opt Options) []byte {
 // (go test ./envoy -update rewrites them; hack/validate-envoy.sh loads the
 // translator's real output in Envoy).
 func TestGolden(t *testing.T) {
-	for _, name := range []string{"basic", "cidr-any-port", "credentials", "spiffe"} {
+	for _, name := range []string{"basic", "cidr-any-port", "credentials", "http-listener", "spiffe"} {
 		t.Run(name, func(t *testing.T) {
 			got := render(t, load(t, "testdata/"+name+".intent.json"), Options{Dir: goldenDir, AdminPort: 15000})
 			golden := "testdata/" + name + ".golden.json"
@@ -148,10 +150,17 @@ func TestHostWithoutPorts(t *testing.T) {
 // What the translator cannot honour fails loudly instead of being dropped.
 func TestRefusals(t *testing.T) {
 	for name, in := range map[string]*v1.EgressIntent{
-		"dns listener":         func() *v1.EgressIntent { i := intent(); i.Listeners.DNS = 15053; return i }(),
-		"tls without identity": intent(v1.Rule{CIDR: "10.0.0.1/32", TLS: &v1.RuleTLS{Originate: "SPIFFE"}, From: "x"}),
-		"wrong version":        func() *v1.EgressIntent { i := intent(); i.APIVersion = "egress-intent.kubeswift.io/v2"; return i }(),
-		"ipv6 cidr":            intent(v1.Rule{CIDR: "fd00::/8", From: "x"}),
+		"dns listener":          func() *v1.EgressIntent { i := intent(); i.Listeners.DNS = 15053; return i }(),
+		"tls without identity":  intent(v1.Rule{CIDR: "10.0.0.1/32", TLS: &v1.RuleTLS{Originate: "SPIFFE"}, From: "x"}),
+		"wrong version":         func() *v1.EgressIntent { i := intent(); i.APIVersion = "egress-intent.kubeswift.io/v2"; return i }(),
+		"ipv6 cidr":             intent(v1.Rule{CIDR: "fd00::/8", From: "x"}),
+		"http on transparent":   func() *v1.EgressIntent { i := intent(); i.Listeners.HTTP = i.Listeners.Transparent; return i }(),
+		"http with credentials": credIntent(func(i *v1.EgressIntent) { i.Listeners.HTTP = 3128 }),
+		"http with tls rule": func() *v1.EgressIntent {
+			i := spiffeIntent(v1.Rule{CIDR: "10.0.0.1/32", TLS: &v1.RuleTLS{Originate: "SPIFFE"}, From: "x"})
+			i.Listeners.HTTP = 3128
+			return i
+		}(),
 	} {
 		if _, err := Translate(in, Options{Dir: goldenDir}); err == nil {
 			t.Errorf("%s: translated, want an error", name)
@@ -318,6 +327,60 @@ func TestSPIFFERefusals(t *testing.T) {
 	} {
 		if _, err := Translate(in, Options{Dir: goldenDir}); err == nil {
 			t.Errorf("%s: translated, want an error", name)
+		}
+	}
+}
+
+// The cidr expression matches the canonical dotted addresses inside the
+// prefix on the rule's port, and nothing else.
+func TestAuthorityRegex(t *testing.T) {
+	for _, tc := range []struct {
+		cidr  string
+		port  int
+		match []string
+		miss  []string
+	}{
+		{"10.96.14.7/32", 8080, []string{"10.96.14.7:8080"}, []string{"10.96.14.7:80", "10.96.14.70:8080", "010.96.14.7:8080", "10.96.14.7"}},
+		{"10.20.16.0/20", 0, []string{"10.20.16.0:1", "10.20.31.255:443", "10.20.20.5"}, []string{"10.20.32.1:443", "10.20.15.255:443", "10.20.16.256:1", "10.20.16.01:1", "example.com:443"}},
+		{"192.168.1.0/24", 80, []string{"192.168.1.9", "192.168.1.9:80"}, []string{"192.168.1.9:8080", "192.168.2.9"}},
+		{"0.0.0.0/0", 443, []string{"8.8.8.8:443", "255.255.255.255:443"}, []string{"8.8.8.8:80", "167772165:443", "0x7f.0.0.1:443", "a.example.com:443"}},
+	} {
+		re := regexp.MustCompile("^(?:" + *authorityRegex([]cidr{{prefix: netip.MustParsePrefix(tc.cidr)}}, tc.port) + ")$")
+		for _, a := range tc.match {
+			if !re.MatchString(a) {
+				t.Errorf("%s port %d: %q not matched by %s", tc.cidr, tc.port, a, re)
+			}
+		}
+		for _, a := range tc.miss {
+			if re.MatchString(a) {
+				t.Errorf("%s port %d: %q matched by %s", tc.cidr, tc.port, a, re)
+			}
+		}
+	}
+}
+
+// A Service is matched by its names on its port: the bare name only in the
+// owner's namespace, never another name, namespace or port.
+func TestServiceAuthorityRegex(t *testing.T) {
+	sv := serviceRule{namespace: "ai", name: "llm", addr: "10.96.0.9", ports: []int{8080}}
+	for _, tc := range []struct {
+		owner string
+		match []string
+		miss  []string
+	}{
+		{"ai", []string{"llm:8080", "llm.ai:8080", "llm.ai.svc:8080", "llm.ai.svc.cluster.local:8080"}, []string{"llm:80", "llm.other:8080", "llmx:8080", "llm.ai.svc.:8080", "x.llm.ai:8080", "llm.ai.svc.cluster.local:8081"}},
+		{"team-a", []string{"llm.ai:8080"}, []string{"llm:8080"}},
+	} {
+		re := regexp.MustCompile("^(?:" + sv.authorityRegex(tc.owner, 8080) + ")$")
+		for _, a := range tc.match {
+			if !re.MatchString(a) {
+				t.Errorf("owner %s: %q not matched by %s", tc.owner, a, re)
+			}
+		}
+		for _, a := range tc.miss {
+			if re.MatchString(a) {
+				t.Errorf("owner %s: %q matched by %s", tc.owner, a, re)
+			}
 		}
 	}
 }

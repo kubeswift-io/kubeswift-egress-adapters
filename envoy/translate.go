@@ -41,9 +41,31 @@
 // rule for every port is repeated for each port another rule names, or a
 // host rule on 443 would hide it.
 //
-// Not supported, refused with an error: a DNS or HTTP listener, wildcard
-// credential destinations and an intercept CA key without issued
-// certificates (this translator cannot mint).
+// With listeners.http a second listener is an explicit HTTP proxy, the one
+// the guest's HTTP_PROXY and HTTPS_PROXY name (and, in KubeSwift's network
+// mode brokered, the only way out of the guest). A CONNECT request opens a
+// tunnel and an absolute-URI request is forwarded, both by the requested
+// authority:
+//
+//   - host rules match the name and port (a virtual host per host and
+//     port; for HTTP on 80 also the bare name) and Envoy connects to the
+//     address the name resolves to (dynamic forward proxy);
+//
+//   - cidr rules match an IPv4 literal authority inside the prefix and on an
+//     allowed port (a regular expression on :authority), and Envoy connects
+//     to that address;
+//
+//   - a cidr rule resolved from a Service (rule.service) also matches the
+//     Service's names on its ports ("name" in the owner's namespace,
+//     "name.ns", "name.ns.svc", "name.ns.svc.<domain>"), and Envoy connects
+//     to the rule's address, never resolving the name;
+//
+//   - anything else is answered 403.
+//
+// Not supported, refused with an error: a DNS listener, the HTTP listener
+// together with credentials or tls rules, wildcard credential destinations
+// and an intercept CA key without issued certificates (this translator
+// cannot mint).
 package envoy
 
 import (
@@ -142,8 +164,10 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 		return nil, fmt.Errorf("listeners.transparent %d is not a port", l.Transparent)
 	case l.DNS != 0:
 		return nil, fmt.Errorf("listeners.dns is set: this translator does not serve DNS (leave it unset and KubeSwift resolves only allowed names)")
-	case l.HTTP != 0:
-		return nil, fmt.Errorf("listeners.http is set: this translator has no explicit HTTP proxy listener")
+	case l.HTTP != 0 && (l.HTTP < 1 || l.HTTP > 65535 || l.HTTP == l.Transparent):
+		return nil, fmt.Errorf("listeners.http %d is not a free port", l.HTTP)
+	case l.HTTP != 0 && len(in.Credentials) > 0:
+		return nil, fmt.Errorf("listeners.http with credentials: this translator does not intercept CONNECT tunnels yet")
 	}
 
 	tlsHosts := map[int][]string{}
@@ -152,6 +176,7 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 	cidrByPort := map[int][]cidr{}           // port 0: every port
 	spiffeCIDRByPort := map[int][]cidr{}
 	ports := map[int]bool{}
+	var services []serviceRule
 	anyOriginate := false
 	for i, r := range in.Allow {
 		originate := false
@@ -201,6 +226,9 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 				return nil, fmt.Errorf("allow[%d] (%s): cidr %q is not an IPv4 prefix", i, r.From, r.CIDR)
 			}
 			c := cidr{prefix: pfx.Masked(), from: r.From}
+			if r.Service != nil && pfx.Bits() == 32 && len(rulePorts) > 0 {
+				services = append(services, serviceRule{namespace: r.Service.Namespace, name: r.Service.Name, addr: pfx.Addr().String(), ports: rulePorts})
+			}
 			byPort := cidrByPort
 			if originate {
 				byPort = spiffeCIDRByPort
@@ -216,7 +244,16 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 			return nil, fmt.Errorf("allow[%d] (%s): neither host nor cidr", i, r.From)
 		}
 	}
+	if l.HTTP != 0 && anyOriginate {
+		return nil, fmt.Errorf("listeners.http with a tls rule: this translator does not originate TLS on the HTTP listener yet")
+	}
 	files := map[string][]byte{}
+	var listeners, httpClusters []obj
+	if l.HTTP != 0 {
+		var hl obj
+		hl, httpClusters = httpProxyListener(int(l.HTTP), in.Owner.Namespace, tlsHosts, httpHosts, cidrByPort, services)
+		listeners = append(listeners, hl)
+	}
 	icepts, err := intercepts(in, tlsHosts, opt.Dir, files)
 	if err != nil {
 		return nil, err
@@ -311,31 +348,30 @@ func Translate(in *v1.EgressIntent, opt Options) (map[string][]byte, error) {
 	if len(icepts) > 0 {
 		clusters = append(clusters, dfpClusterDef(dfpTLSCluster, &opt))
 	}
+	clusters = append(clusters, httpClusters...)
 	if spiffe != nil {
 		clusters = append(clusters, spiffe.clusters()...)
 	}
 
-	bootstrap := obj{
-		"static_resources": obj{
-			"listeners": []obj{{
-				"name":    "transparent",
-				"address": obj{"socket_address": obj{"address": "0.0.0.0", "port_value": l.Transparent}},
-				"listener_filters": []obj{
-					{"name": "envoy.filters.listener.original_dst", "typed_config": typed("envoy.extensions.filters.listener.original_dst.v3.OriginalDst", nil)},
-					{"name": "envoy.filters.listener.tls_inspector", "typed_config": typed("envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector", nil)},
-					{"name": "envoy.filters.listener.http_inspector", "typed_config": typed("envoy.extensions.filters.listener.http_inspector.v3.HttpInspector", nil)},
-				},
-				"filter_chains": chains,
-			}},
-			"clusters": clusters,
+	listeners = append([]obj{{
+		"name":    "transparent",
+		"address": obj{"socket_address": obj{"address": "0.0.0.0", "port_value": l.Transparent}},
+		"listener_filters": []obj{
+			{"name": "envoy.filters.listener.original_dst", "typed_config": typed("envoy.extensions.filters.listener.original_dst.v3.OriginalDst", nil)},
+			{"name": "envoy.filters.listener.tls_inspector", "typed_config": typed("envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector", nil)},
+			{"name": "envoy.filters.listener.http_inspector", "typed_config": typed("envoy.extensions.filters.listener.http_inspector.v3.HttpInspector", nil)},
 		},
+		"filter_chains": chains,
+	}}, listeners...)
+	bootstrap := obj{
+		"static_resources": obj{"listeners": listeners, "clusters": clusters},
 	}
 	if len(icepts) > 0 || spiffe != nil {
 		// SDS needs a node identity.
 		bootstrap["node"] = obj{"id": "kubeswift-sandbox", "cluster": "kubeswift-egress"}
 	}
 	if opt.AdminPort > 0 {
-		if opt.AdminPort > 65535 || int32(opt.AdminPort) == l.Transparent {
+		if opt.AdminPort > 65535 || int32(opt.AdminPort) == l.Transparent || int32(opt.AdminPort) == l.HTTP {
 			return nil, fmt.Errorf("admin port %d is not a free port", opt.AdminPort)
 		}
 		bootstrap["admin"] = obj{"address": obj{"socket_address": obj{"address": "127.0.0.1", "port_value": opt.AdminPort}}}

@@ -33,6 +33,10 @@ jobs:
       - name: credentials behaviour
         run: |
           for v in v1.36.2 v1.35.6; do ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/e2e-envoy-credentials.sh; done
+      # The explicit HTTP listener: CONNECT and absolute-URI requests.
+      - name: http listener behaviour
+        run: |
+          for v in v1.36.2 v1.35.6; do ENVOY_IMAGE=docker.io/envoyproxy/envoy:$v ./hack/e2e-envoy-http.sh; done
 
   image:
     runs-on: ubuntu-latest
