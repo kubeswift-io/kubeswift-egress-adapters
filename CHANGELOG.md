@@ -5,7 +5,7 @@
 ### Changed
 
 - `intent/v1`: `rule.service` (the Service a cidr rule was resolved from);
-  schema pinned to kubeswift-io/kubeswift@e4777c70.
+  schema pinned to kubeswift-io/kubeswift@b2a854e9.
 
 ### Added
 
