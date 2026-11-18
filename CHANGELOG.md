@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Envoy: an explicit HTTP proxy listener for `listeners.http`, for KubeSwift's
+  network mode `brokered` (where it is the guest's only way out) and for
+  `HTTP_PROXY` clients in mode `proxied`. `CONNECT` tunnels and absolute-URI
+  requests are matched by authority: a `host` rule by name and port (Envoy
+  connects to the name's address), a `cidr` rule by a canonical IPv4 literal
+  in its prefix and on its ports; anything else gets 403. Still refused with
+  credentials or `rule.tls`. `hack/e2e-envoy-http.sh` checks the behaviour
+  against a real Envoy (CI, v1.36.2 and v1.35.6).
+
 ## [v0.4.0] - 2026-11-18
 
 An agentgateway translator, for proxies behind KubeSwift's PROXY protocol relay.

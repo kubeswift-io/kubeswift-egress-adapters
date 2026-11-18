@@ -1,0 +1,12 @@
+{
+  "apiVersion": "egress-intent.kubeswift.io/v1",
+  "kind": "EgressIntent",
+  "owner": {"namespace": "team-a", "kind": "SwiftSandbox", "name": "agent"},
+  "listeners": {"transparent": 15006, "http": 3128},
+  "allow": [
+    {"host": "api.example.com", "ports": [{"port": 443, "protocol": "TCP"}], "from": "host api.example.com"},
+    {"host": "*.githubusercontent.com", "from": "host *.githubusercontent.com"},
+    {"cidr": "10.96.14.7/32", "ports": [{"port": 8080, "protocol": "TCP"}], "from": "service ai/llm-gateway"},
+    {"cidr": "10.20.16.0/20", "from": "cidr 10.20.16.0/20"}
+  ]
+}

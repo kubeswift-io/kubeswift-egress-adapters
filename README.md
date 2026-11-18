@@ -43,8 +43,16 @@ preset's readiness probe checks after a swap.
 With `rule.tls` (KubeSwift's `allow[].tls`) Envoy originates SPIFFE mTLS with
 the sandbox's SVID, read over SDS from the agent's Workload API socket.
 
-Not supported yet, refused with an error: a DNS listener, an explicit HTTP
-listener and wildcard credential destinations.
+With `listeners.http` Envoy also serves an explicit HTTP proxy there, the one
+the guest's `HTTP_PROXY` and `HTTPS_PROXY` name (in KubeSwift's network mode
+`brokered` the guest's only way out). A `CONNECT` opens a tunnel and an
+absolute-URI request is forwarded, both by the authority the guest asked for:
+a `host` rule matches name and port and Envoy connects to the name's address;
+a `cidr` rule matches an IPv4 literal (canonical dotted form only) in its
+prefix and on its ports; anything else gets 403.
+
+Not supported yet, refused with an error: a DNS listener, the HTTP listener
+together with credentials or `rule.tls`, and wildcard credential destinations.
 
 The image is `ghcr.io/kubeswift-io/kubeswift-egress-adapters/envoy-translator`
 and carries the label `io.kubeswift.egress-intent.versions=v1`.
@@ -96,6 +104,7 @@ go test ./...                 # unit and golden tests
 go test ./envoy -update       # rewrite envoy/testdata/*.golden.json
 ./hack/validate-envoy.sh      # load the translator's output in a real Envoy (docker)
 ./hack/e2e-envoy-credentials.sh   # credential path end to end (docker)
+./hack/e2e-envoy-http.sh          # HTTP listener end to end (docker, internet)
 ./hack/validate-agentgateway.sh   # load the agentgateway output in a real agentgateway (docker)
 docker build -f images/envoy-translator/Containerfile .
 docker build -f images/agentgateway-translator/Containerfile .
