@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [v0.4.0] - 2026-11-18
+
+An agentgateway translator, for proxies behind KubeSwift's PROXY protocol relay.
 
 ### Added
 
@@ -17,7 +19,8 @@
 
 ### Changed
 
-- `intent/v1`: `listeners.proxyProtocol` and the `proxy-protocol` feature.
+- `intent/v1`: `listeners.proxyProtocol` and the `proxy-protocol` feature;
+  schema pinned to kubeswift-io/kubeswift@a829bb1d.
 
 ## [v0.3.0] - 2026-11-17
 
