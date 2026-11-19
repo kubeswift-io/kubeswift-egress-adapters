@@ -28,6 +28,11 @@ docker network create "$net" >/dev/null
 docker run -d --name "$net-up" --network "$net" "$PY_IMAGE" \
 	sh -c 'python3 -m http.server 8080 & exec python3 -m http.server 8081' >/dev/null
 up=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$net\").IPAddress}}" "$net-up")
+# The checks below need the upstream answering on both ports.
+for port in 8080 8081; do
+	for _ in $(seq 120); do curl -s -m 1 -o /dev/null "http://$up:$port/" && break; sleep 0.5; done
+	curl -s -m 2 -o /dev/null "http://$up:$port/" || { echo "FAIL: upstream not answering on $port" >&2; exit 1; }
+done
 mkdir -p "$work/out"
 cat > "$work/intent.json" <<EOF
 {"apiVersion": "egress-intent.kubeswift.io/v1", "kind": "EgressIntent",
